@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tramoya"
+version = "1.4.0"
+description = "The backstage machinery for your state machines. One file. Zero deps."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Raul", email = "msc.framework@gmail.com" },
+]
+keywords = [
+    "state-machine", "fsm", "finite-state-machine", "automaton",
+    "transitions", "guards", "workflow", "statechart",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/esraderey/tramoya"
+Repository = "https://github.com/esraderey/tramoya"
+Issues = "https://github.com/esraderey/tramoya/issues"
+
+[tool.hatch.build.targets.sdist]
+include = ["tramoya.py", "py.typed", "LICENSE", "README.md", "CHANGELOG.md"]
+
+[tool.hatch.build.targets.wheel]
+include = ["tramoya.py", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
