@@ -31,9 +31,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/esraderey/tramoya"
-Repository = "https://github.com/esraderey/tramoya"
-Issues = "https://github.com/esraderey/tramoya/issues"
+Homepage = "https://github.com/ElEscribanoSilente/tramoya"
+Repository = "https://github.com/ElEscribanoSilente/tramoya"
+Issues = "https://github.com/ElEscribanoSilente/tramoya/issues"
 
 [tool.hatch.build.targets.sdist]
 include = ["tramoya.py", "py.typed", "LICENSE", "README.md", "CHANGELOG.md"]
