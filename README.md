@@ -1,7 +1,7 @@
 # tramoya
 
 **Finite state machines that fit in your head. Pure Python, production-ready.**  
-*Guards · Entry/Exit hooks · Undo history · JSON serialization · Graphviz export · 291 lines · Zero dependencies.*
+*Guards · Entry/Exit hooks · Undo history · JSON serialization · Graphviz & Mermaid export · Zero dependencies.*
 
 ```python
 from tramoya import Machine
@@ -37,16 +37,13 @@ State machine libraries in Python fall into two traps: either they demand class 
 | Entry/exit hooks | ✓ | ✓ | ✓ |
 | Transition actions | ✓ | ✓ | ✓ |
 | Undo / history | ✓ | ✗ | ✗ |
-| JSON serialization | ✓ | ✗ | ✗ |
-| Graphviz DOT export | ✓ | ✓ | ✓ |
+| JSON snapshot (runtime state) | ✓ | ✗ | ✗ |
+| Graphviz DOT + Mermaid export | ✓ | ✓ | ✓ |
 | Introspection (can / available) | ✓ | ✓ | partial |
 | No class inheritance required | ✓ | partial | ✗ |
 | Dependencies | **0** | 0 | 0 |
-| Lines of code | **291** | 2000+ | 1500+ |
 
-**transitions** is the most popular option — and it works. But defining a machine requires creating a model class, configuring callback naming conventions (`on_enter_STATE`, `before_TRIGGER`), and navigating 2000+ lines of source when something goes wrong.
-
-**tramoya** gives you the same power with plain Python data structures. If you can write a list of tuples, you can build a state machine.
+**transitions** is the most popular option — battle-tested, with async support, thread-safe variants, and a rich plugin ecosystem. tramoya trades that breadth for simplicity: plain data structures, one file, no class inheritance. If you can write a list of tuples, you can build a state machine.
 
 ---
 
@@ -483,7 +480,7 @@ save_machine(doc)
 | `trigger(name, **kwargs)` | `str` | Fire a trigger. Returns new state. |
 | `can(trigger, **kwargs)` | `bool` | Check if trigger would fire (evaluates guards). |
 | `undo()` | `str` | Revert to previous state. |
-| `reset(state=None)` | `None` | Reset to a specific state or earliest in history. |
+| `reset(state=None, clear_ctx=True)` | `None` | Reset to a state (default: initial). Clears ctx by default. |
 | `to_dict()` | `dict` | Serialize runtime state. |
 | `load_dict(data)` | `None` | Restore runtime state. |
 | `to_json()` | `str` | Serialize to JSON string. |
@@ -519,8 +516,8 @@ Inheritance couples your domain objects to the FSM library. With tramoya, the ma
 **Why separate `on_enter`/`on_exit` from transition actions?**  
 Enter/exit hooks are about the *state*. Actions are about the *transition*. "Send email when entering `approved`" should fire regardless of *how* you got there. "Log who approved it" is specific to the approval transition.
 
-**Why no async?**  
-State transitions are inherently synchronous — they're instant state changes. If your hooks need to call async functions, wrap them with `asyncio.run()` or schedule them on your event loop. Adding async to the FSM itself would double the API surface for zero practical benefit.
+**Why no async?**
+tramoya is synchronous-only. If your guards or hooks need to call async functions, wrap them with `asyncio.run()` or schedule them on your event loop. A native `AsyncMachine` may come in a future version.
 
 ---
 

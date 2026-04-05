@@ -1,12 +1,7 @@
 """
 tramoya.py — The backstage machinery for your state machines. One file. Zero deps.
 
-What others do wrong:
-  - transitions: 2000+ lines, class-heavy, confusing callback system
-  - statemachine: requires class inheritance, verbose
-  - pytransitions: dead project
-
-What tramoya does right:
+What tramoya does:
   ✓ Define machines with plain dicts or decorators (MachineBuilder)
   ✓ Guards (conditional transitions)
   ✓ Entry/exit actions per state
@@ -16,10 +11,14 @@ What tramoya does right:
   ✓ Internal transitions (dest=None, no exit/enter callbacks)
   ✓ History tracking with undo
   ✓ Observers (subscribe to all transitions)
-  ✓ Serializable (JSON in, JSON out)
+  ✓ Serializable (runtime snapshot via JSON — topology must be reconstructed)
   ✓ Dot + Mermaid graph export
   ✓ Batch triggers (trigger_many)
-  ✓ ~300 lines of logic
+
+Limitations:
+  - Not thread-safe: no locking on state/ctx/history mutations
+  - No async support: callbacks are synchronous only
+  - SubMachine has no automatic done-state propagation to parent
 
 Usage:
     from tramoya import Machine
@@ -65,11 +64,12 @@ from __future__ import annotations
 
 import copy
 import json
+from collections import deque
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple, Union
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 __all__ = [
     "Machine", "MachineBuilder", "SubMachine", "ParallelMachine", "WILDCARD",
     "MachineError", "InvalidTransition", "GuardRejected",
@@ -149,7 +149,7 @@ class Machine:
         self._state: str = initial
         self._initial: str = initial
         self.ctx: Dict[str, Any] = ctx or {}
-        self._history: List[Tuple[str, Dict[str, Any]]] = []
+        self._history: Deque[Tuple[str, Dict[str, Any]]] = deque(maxlen=history_size if history_size > 0 else None)
         self._history_size = history_size
         self._observers: List[Callable[..., Any]] = []
 
@@ -172,6 +172,11 @@ class Machine:
         if isinstance(t, _Transition):
             tr = t
         else:
+            if not isinstance(t, (tuple, list)) or len(t) < 3:
+                raise MachineError(
+                    f"Transition must be a tuple of (trigger, source, dest[, guard][, action]), "
+                    f"got {t!r} (length {len(t) if isinstance(t, (tuple, list)) else 'N/A'})"
+                )
             trigger, src, dst = t[0], t[1], t[2]
             guard = t[3] if len(t) > 3 else None
             action = t[4] if len(t) > 4 else None
@@ -201,8 +206,6 @@ class Machine:
     def _push_history(self, state: str, ctx_snapshot: Dict[str, Any]) -> None:
         if self._history_size > 0:
             self._history.append((state, ctx_snapshot))
-            if len(self._history) > self._history_size:
-                self._history.pop(0)
 
     def _notify(self, trigger: str, src: str, dst: str, ctx: Dict[str, Any]) -> None:
         if self._on_transition:
@@ -361,13 +364,20 @@ class Machine:
         self.ctx.update(ctx_snapshot)
         return self._state
 
-    def reset(self, state: Optional[str] = None) -> None:
-        """Reset to a state (default: initial state)."""
+    def reset(self, state: Optional[str] = None, clear_ctx: bool = True) -> None:
+        """Reset to a state (default: initial state).
+
+        Args:
+            state:     Target state (default: initial).
+            clear_ctx: If True (default), clears ctx. Pass False to preserve ctx.
+        """
         target = self._initial if state is None else state
         if target not in self._states:
             raise MachineError(f"Unknown state '{target}'")
         self._state = target
         self._history.clear()
+        if clear_ctx:
+            self.ctx.clear()
 
     # ── Observers ─────────────────────────────────────────────────────────
 
@@ -416,7 +426,8 @@ class Machine:
         # Truncate to history_size to prevent unbounded memory from untrusted input
         if self._history_size > 0 and len(history) > self._history_size:
             history = history[-self._history_size:]
-        self._history = history
+        maxlen = self._history_size if self._history_size > 0 else None
+        self._history = deque(history, maxlen=maxlen)
 
     @classmethod
     def from_dict(
@@ -502,13 +513,22 @@ class Machine:
                     lines.append(f"    {src} --> {dst} : {label}")
         return "\n".join(lines)
 
+    def _transition_topology(self) -> Dict[str, List[Tuple[str, Optional[str], bool, bool]]]:
+        """Extract transition topology for equality comparison.
+        Returns {trigger: [(source, dest, has_guard, has_action), ...]}."""
+        return {
+            trigger: [(tr.source, tr.dest, tr.guard is not None, tr.action is not None) for tr in trans]
+            for trigger, trans in self._transitions.items()
+        }
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Machine):
             return NotImplemented
         return (self._state == other._state
                 and self.ctx == other.ctx
                 and self._history == other._history
-                and self._states == other._states)
+                and self._states == other._states
+                and self._transition_topology() == other._transition_topology())
 
     def __repr__(self) -> str:
         return f"Machine(state={self._state!r}, triggers={self.available_triggers})"
@@ -623,7 +643,11 @@ class ParallelMachine:
     def trigger(self, name: str, **kwargs: Any) -> Dict[str, str]:
         """Broadcast trigger to all regions that can handle it.
         Returns composite state. Raises InvalidTransition only if
-        NO region can handle the trigger."""
+        NO region can handle the trigger.
+
+        Note: guards are evaluated twice per region (once in can(), once in
+        trigger()). Guards must be pure functions — side effects in guards
+        (I/O, counters, logging) will execute twice."""
         fired = False
         for m in self._regions.values():
             if m.can(name, **kwargs):
@@ -822,7 +846,7 @@ if __name__ == "__main__":
         on_transition=lambda t, s, d, c: print(f"    >> {s} --{t}--> {d}"),
     )
 
-    print("tramoya v1.3 demo:")
+    print(f"tramoya v{__version__} demo:")
     print(f"  state = {order.state}")
     order.trigger("submit")
     print(f"  submit → {order.state}")
