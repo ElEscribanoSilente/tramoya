@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tramoya"
-version = "1.4.1"
+version = "1.5.0"
 description = "The backstage machinery for your state machines. One file. Zero deps."
 readme = "README.md"
 license = "MIT"

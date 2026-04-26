@@ -14,6 +14,10 @@ What tramoya does:
   ✓ Serializable (runtime snapshot via JSON — topology must be reconstructed)
   ✓ Dot + Mermaid graph export
   ✓ Batch triggers (trigger_many)
+  ✓ Imperative dispatch (transition_to(dest)) for non-event-driven integration
+  ✓ Typed reason field on InvalidTransition / GuardRejected
+  ✓ Opt-in shallow ctx snapshots (shallow_ctx=True) for hot paths
+  ✓ Precomputed dispatch index — O(1) trigger lookup
 
 Limitations:
   - Not thread-safe: no locking on state/ctx/history mutations
@@ -64,12 +68,13 @@ from __future__ import annotations
 
 import copy
 import json
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple, Union
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 __all__ = [
     "Machine", "MachineBuilder", "SubMachine", "ParallelMachine", "WILDCARD",
     "MachineError", "InvalidTransition", "GuardRejected",
@@ -84,13 +89,30 @@ class MachineError(Exception):
     pass
 
 class InvalidTransition(MachineError):
-    def __init__(self, trigger: str, state: str):
-        self.trigger, self.state = trigger, state
+    """No transition matches the trigger from the current state.
+
+    Attributes:
+        trigger: Trigger name that was attempted.
+        state:   State the machine was in.
+        reason:  One of "no_edge" (no transition registered), "unknown_state"
+                 (raised by transition_to() when the destination state is not
+                 declared). Defaults to "no_edge".
+    """
+    def __init__(self, trigger: str, state: str, reason: str = "no_edge"):
+        self.trigger, self.state, self.reason = trigger, state, reason
         super().__init__(f"No transition '{trigger}' from state '{state}'")
 
 class GuardRejected(MachineError):
-    def __init__(self, trigger: str, state: str):
-        self.trigger, self.state = trigger, state
+    """All candidate transitions for the trigger were blocked by guards.
+
+    Attributes:
+        trigger: Trigger name that was attempted.
+        state:   State the machine was in.
+        reason:  Always "guard_rejected". Provided for parity with
+                 InvalidTransition.reason for typed dispatch on errors.
+    """
+    def __init__(self, trigger: str, state: str, reason: str = "guard_rejected"):
+        self.trigger, self.state, self.reason = trigger, state, reason
         super().__init__(f"Guard rejected '{trigger}' from '{state}'")
 
 
@@ -121,6 +143,13 @@ class Machine:
         on_transition: Global callback(trigger, src, dst, ctx) on every transition.
         ctx:           Arbitrary context dict carried through the machine.
         history_size:  Max undo steps (0 = disabled).
+        shallow_ctx:   If True, ctx snapshots use dict() instead of deepcopy().
+                       10-50× faster for large/complex ctx, but mutable values
+                       inside ctx (lists, dicts, custom objects) are NOT
+                       protected — undo() and rollback-on-callback-failure will
+                       see post-mutation state for nested values. Use only when
+                       you know your actions don't mutate nested ctx values
+                       in-place. Default False (full transactional safety).
     """
 
     def __init__(
@@ -133,6 +162,7 @@ class Machine:
         on_transition: Optional[Callable[..., Any]] = None,
         ctx: Optional[Dict[str, Any]] = None,
         history_size: int = 50,
+        shallow_ctx: bool = False,
     ):
         # Validate inputs
         for s in states:
@@ -143,6 +173,11 @@ class Machine:
 
         self._states: Set[str] = set(states)
         self._transitions: Dict[str, List[_Transition]] = {}
+        # Precomputed dispatch indices for O(1) lookup.
+        # Built lazily by _add_transition; never mutated after __init__.
+        self._dispatch: Dict[Tuple[str, str], List[_Transition]] = {}        # (source, trigger) -> [trans]
+        self._wildcard_dispatch: Dict[str, List[_Transition]] = {}           # trigger -> [trans] (source="*")
+        self._reverse_dispatch: Dict[str, List[Tuple[str, str]]] = {}        # dest -> [(source, trigger), ...]
         self._on_enter: Dict[str, Callable[..., Any]] = on_enter or {}
         self._on_exit: Dict[str, Callable[..., Any]] = on_exit or {}
         self._on_transition: Optional[Callable[..., Any]] = on_transition
@@ -151,6 +186,7 @@ class Machine:
         self.ctx: Dict[str, Any] = ctx or {}
         self._history: Deque[Tuple[str, Dict[str, Any]]] = deque(maxlen=history_size if history_size > 0 else None)
         self._history_size = history_size
+        self._shallow_ctx = shallow_ctx
         self._observers: List[Callable[..., Any]] = []
 
         if initial not in self._states:
@@ -190,18 +226,30 @@ class Machine:
 
         self._transitions.setdefault(tr.trigger, []).append(tr)
 
+        # Populate dispatch indices. Explicit and wildcard live in separate
+        # dicts so _match_candidates can preserve "explicit beats wildcard"
+        # ordering with two O(1) lookups instead of a scan.
+        if tr.source == WILDCARD:
+            self._wildcard_dispatch.setdefault(tr.trigger, []).append(tr)
+        else:
+            self._dispatch.setdefault((tr.source, tr.trigger), []).append(tr)
+
+        # Reverse index: dest -> [(source, trigger), ...]. Used by transition_to().
+        # Internal transitions (dest=None) are excluded — they're not "going anywhere".
+        if tr.dest is not None:
+            self._reverse_dispatch.setdefault(tr.dest, []).append((tr.source, tr.trigger))
+
     def _match_candidates(self, name: str) -> List[_Transition]:
         """Get transitions matching trigger name from current state.
         Explicit source matches come first (in registration order),
         then wildcard matches. This guarantees explicit > wildcard priority."""
-        explicit = []
-        wildcard = []
-        for tr in self._transitions.get(name, []):
-            if tr.source == self._state:
-                explicit.append(tr)
-            elif tr.source == WILDCARD:
-                wildcard.append(tr)
-        return explicit + wildcard
+        explicit = self._dispatch.get((self._state, name), ())
+        wildcard = self._wildcard_dispatch.get(name, ())
+        if not explicit:
+            return list(wildcard)
+        if not wildcard:
+            return list(explicit)
+        return [*explicit, *wildcard]
 
     def _push_history(self, state: str, ctx_snapshot: Dict[str, Any]) -> None:
         if self._history_size > 0:
@@ -234,18 +282,15 @@ class Machine:
 
     @property
     def available_triggers(self) -> List[str]:
-        """Triggers valid from current state (ignores guards)."""
-        seen: Set[str] = set()
-        result: List[str] = []
-        for trigger, trans in self._transitions.items():
-            if trigger in seen:
-                continue
-            for tr in trans:
-                if tr.source == self._state or tr.source == WILDCARD:
-                    result.append(trigger)
-                    seen.add(trigger)
-                    break
-        return result
+        """Triggers valid from current state (ignores guards).
+
+        Iteration order is registration order of triggers (first time each
+        trigger name was seen in the transitions list passed to __init__)."""
+        state = self._state
+        return [
+            trigger for trigger in self._transitions
+            if (state, trigger) in self._dispatch or trigger in self._wildcard_dispatch
+        ]
 
     @property
     def is_final(self) -> bool:
@@ -289,9 +334,11 @@ class Machine:
             if tr.guard is not None and not tr.guard(frozen):
                 continue
 
-            # Guard passed — snapshot before mutation, then commit
+            # Guard passed — snapshot before mutation, then commit.
+            # shallow_ctx=True swaps deepcopy for dict() — 10-50× cheaper but
+            # nested mutable values are aliased (see Machine.__init__ docstring).
             old_state = self._state
-            old_ctx = copy.deepcopy(self.ctx)
+            old_ctx = dict(self.ctx) if self._shallow_ctx else copy.deepcopy(self.ctx)
             self.ctx.update(kwargs)
 
             # Internal transition: action only, no state change, no enter/exit
@@ -350,6 +397,66 @@ class Machine:
                 self.trigger(t[0], **t[1])
         return self._state
 
+    def transition_to(self, dest: str, **kwargs: Any) -> str:
+        """Move to `dest` by firing whichever registered trigger leads there.
+
+        Useful when integrating with code that wants to set state imperatively
+        (`obj.state = NEW`) rather than event-driven.
+
+        Resolution order: candidate triggers (those with an edge to `dest` from
+        the current state, or from "*") are tried in registration order,
+        explicit sources before wildcards. For each candidate, we predict what
+        trigger() would actually fire: if the first guard-passing edge of that
+        trigger lands in `dest`, we commit. If it lands elsewhere (because
+        another transition with the same trigger name has higher priority), we
+        skip and try the next candidate. This avoids silently firing the wrong
+        edge when a trigger name is overloaded.
+
+        Raises:
+            InvalidTransition(reason="unknown_state"): `dest` is not declared.
+            InvalidTransition(reason="no_edge"):       no edge from current
+                                                       state to `dest` exists.
+            GuardRejected(reason="guard_rejected"):    edges exist but no
+                                                       candidate trigger
+                                                       deterministically lands
+                                                       in `dest`.
+        """
+        if dest not in self._states:
+            raise InvalidTransition(f"->{dest}", self._state, reason="unknown_state")
+
+        state = self._state
+        # Collect candidate triggers in registration order, dedup, preserving
+        # explicit-before-wildcard preference.
+        seen: Set[str] = set()
+        explicit_triggers: List[str] = []
+        wildcard_triggers: List[str] = []
+        for src, trigger in self._reverse_dispatch.get(dest, ()):
+            if trigger in seen:
+                continue
+            if src == state:
+                explicit_triggers.append(trigger)
+                seen.add(trigger)
+            elif src == WILDCARD:
+                wildcard_triggers.append(trigger)
+                seen.add(trigger)
+
+        candidates = explicit_triggers + wildcard_triggers
+        if not candidates:
+            raise InvalidTransition(f"->{dest}", state, reason="no_edge")
+
+        # For each candidate trigger, predict what trigger() would actually fire
+        # by walking _match_candidates in priority order with guards evaluated
+        # against a frozen view. Only commit if the winning edge's dest matches.
+        frozen = MappingProxyType({**self.ctx, **kwargs})
+        for trigger in candidates:
+            for tr in self._match_candidates(trigger):
+                if tr.guard is None or tr.guard(frozen):
+                    if tr.dest == dest:
+                        return self.trigger(trigger, **kwargs)
+                    break  # Higher-priority edge wins and goes elsewhere — skip this trigger.
+
+        raise GuardRejected(f"->{dest}", state)
+
     def undo(self) -> str:
         """Revert to previous state and context. No callbacks fired.
 
@@ -392,8 +499,13 @@ class Machine:
     # ── Serialization ─────────────────────────────────────────────────────
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize runtime state. Includes "initial" since 1.5.0 so that
+        round-trips through from_dict() preserve reset() semantics. Older
+        snapshots without "initial" remain loadable (initial falls back to
+        the snapshotted state, matching pre-1.5.0 behavior)."""
         return {
             "state": self._state,
+            "initial": self._initial,
             "ctx": dict(self.ctx),
             "history": [{"state": s, "ctx": dict(c)} for s, c in self._history],
         }
@@ -402,6 +514,14 @@ class Machine:
         s = data["state"]
         if not isinstance(s, str) or s not in self._states:
             raise MachineError(f"Unknown state '{s}'")
+
+        # Restore _initial if present (since 1.5.0). Validate against declared
+        # states. Absent in legacy snapshots → leave self._initial untouched.
+        if "initial" in data:
+            init = data["initial"]
+            if not isinstance(init, str) or init not in self._states:
+                raise MachineError(f"Unknown initial state '{init}'")
+            self._initial = init
 
         raw_hist = data.get("history", [])
         history: List[Tuple[str, Dict[str, Any]]] = []
@@ -423,8 +543,15 @@ class Machine:
         self._state = s
         self.ctx.clear()
         self.ctx.update(data.get("ctx", {}))
-        # Truncate to history_size to prevent unbounded memory from untrusted input
+        # Truncate to history_size to prevent unbounded memory from untrusted input.
+        # 1.5.0: silent truncation is deprecated. 2.0.0 will raise instead.
         if self._history_size > 0 and len(history) > self._history_size:
+            warnings.warn(
+                f"history truncated from {len(history)} to {self._history_size} entries; "
+                f"will raise MachineError in tramoya 2.0",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             history = history[-self._history_size:]
         maxlen = self._history_size if self._history_size > 0 else None
         self._history = deque(history, maxlen=maxlen)
@@ -437,8 +564,28 @@ class Machine:
         data: Dict[str, Any],
         **kwargs: Any,
     ) -> "Machine":
-        """Reconstruct machine from serialized dict."""
-        m = cls(states=states, transitions=transitions, initial=data["state"], **kwargs)
+        """Reconstruct machine from serialized dict.
+
+        kwargs are forwarded to __init__ (on_enter, on_exit, on_transition,
+        history_size, shallow_ctx). Passing `ctx` is a no-op — ctx is restored
+        from `data` — and emits DeprecationWarning since 1.5.0; will raise in
+        2.0.
+
+        Initial state resolution: uses data["initial"] if present (1.5.0+
+        snapshots), falls back to data["state"] for legacy snapshots. The
+        legacy fallback preserves the pre-1.5.0 behavior where reset() after
+        from_dict() landed on the snapshotted state, not the original initial.
+        """
+        if "ctx" in kwargs:
+            warnings.warn(
+                "ctx kwarg passed to from_dict() is ignored — ctx is restored from data. "
+                "Will raise TypeError in tramoya 2.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            kwargs.pop("ctx")
+        initial = data.get("initial", data["state"])
+        m = cls(states=states, transitions=transitions, initial=initial, **kwargs)
         m.load_dict(data)
         return m
 
@@ -465,6 +612,26 @@ class Machine:
     def _mermaid_id(s: str) -> str:
         """Sanitize state name for Mermaid node ID (alphanumeric + underscore)."""
         return "".join(c if c.isalnum() or c == "_" else "_" for c in s)
+
+    @staticmethod
+    def _mermaid_label(s: str) -> str:
+        """Escape characters that break Mermaid stateDiagram-v2 transition labels.
+
+        Mermaid uses ":" to separate the edge from its label, "|" inside choice
+        nodes, and parses HTML in labels. Without escaping, a trigger named
+        "price>50" or "foo:bar" silently breaks the render (blank diagram, no
+        parse error). HTML entities render correctly in Mermaid output.
+
+        Replace order matters: "&" first, otherwise the entities we insert
+        below would themselves be escaped."""
+        return (s
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace(":", "&#58;")
+                .replace("|", "&#124;")
+                .replace('"', "&quot;")
+                .replace("\n", "<br/>"))
 
     def to_dot(self, title: str = "machine") -> str:
         """Export to Graphviz DOT format."""
@@ -494,12 +661,16 @@ class Machine:
         return "\n".join(lines)
 
     def to_mermaid(self) -> str:
-        """Export to Mermaid stateDiagram-v2 format."""
+        """Export to Mermaid stateDiagram-v2 format.
+
+        Trigger names are escaped via _mermaid_label() so characters like ":",
+        "|", "<", ">" don't silently break the render."""
         mid = self._mermaid_id
+        mlabel = self._mermaid_label
         lines = ["stateDiagram-v2"]
         for trigger, trans in self._transitions.items():
             for tr in trans:
-                label = trigger
+                label = mlabel(trigger)
                 if tr.guard:
                     label += " [guarded]"
                 if tr.source == WILDCARD:

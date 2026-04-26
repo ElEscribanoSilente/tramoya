@@ -1467,3 +1467,414 @@ class TestParallelMachine:
         m2 = Machine(states=["b"], transitions=[], initial="b", ctx={"y": 2})
         p = ParallelMachine(r1=m1, r2=m2)
         assert p.ctx == {"r1": {"x": 1}, "r2": {"y": 2}}
+
+
+# ─── 1.5.0: initial preserved across round-trip (bug #1) ────────────────────
+
+class TestInitialPreservedRoundTrip:
+    def test_to_dict_includes_initial(self):
+        m = make_order()
+        m.trigger("submit")
+        d = m.to_dict()
+        assert d["initial"] == "draft"
+        assert d["state"] == "submitted"
+
+    def test_reset_after_round_trip_returns_to_initial(self):
+        m = make_order()
+        m.trigger("submit")
+        snap = m.to_json()
+
+        m2 = Machine.from_json(
+            states=["draft", "submitted", "approved", "rejected"],
+            transitions=[
+                ("submit",  "draft",     "submitted"),
+                ("approve", "submitted", "approved"),
+                ("reject",  "submitted", "rejected"),
+                ("revise",  "rejected",  "draft"),
+            ],
+            json_str=snap,
+        )
+        assert m2.state == "submitted"
+        assert m2.initial == "draft"
+        m2.reset()
+        assert m2.state == "draft"  # not "submitted"
+
+    def test_legacy_snapshot_without_initial_still_loads(self):
+        # Pre-1.5.0 snapshots had no "initial" key. They must continue to
+        # load — initial falls back to data["state"], matching pre-1.5.0
+        # (buggy) behavior. No data loss for upgrading users.
+        legacy = {"state": "submitted", "ctx": {"a": 1}, "history": ["draft"]}
+        m = Machine.from_dict(
+            states=["draft", "submitted", "approved", "rejected"],
+            transitions=[("submit", "draft", "submitted")],
+            data=legacy,
+        )
+        assert m.state == "submitted"
+        assert m.initial == "submitted"  # legacy fallback
+
+    def test_load_dict_validates_initial(self):
+        m = make_order()
+        with pytest.raises(MachineError, match="Unknown initial state"):
+            m.load_dict({"state": "draft", "initial": "fake", "ctx": {}, "history": []})
+
+    def test_load_dict_restores_initial(self):
+        m = make_order()
+        m.load_dict({"state": "submitted", "initial": "submitted", "ctx": {}, "history": []})
+        assert m.initial == "submitted"
+
+
+# ─── 1.5.0: Mermaid label escape (bug #5) ───────────────────────────────────
+
+class TestMermaidLabelEscape:
+    def _machine_with_trigger(self, trigger_name: str) -> Machine:
+        return Machine(
+            states=["a", "b"],
+            transitions=[(trigger_name, "a", "b")],
+            initial="a",
+        )
+
+    def test_alphanumeric_unchanged(self):
+        m = self._machine_with_trigger("submit")
+        out = m.to_mermaid()
+        assert ": submit" in out
+        # No HTML entities should appear for plain triggers.
+        assert "&" not in out
+
+    def test_colon_escaped(self):
+        m = self._machine_with_trigger("foo:bar")
+        out = m.to_mermaid()
+        assert "&#58;" in out
+        assert "foo:bar" not in out  # raw colon must not appear
+
+    def test_pipe_escaped(self):
+        m = self._machine_with_trigger("a|b")
+        out = m.to_mermaid()
+        assert "&#124;" in out
+
+    def test_angle_brackets_escaped(self):
+        m = self._machine_with_trigger("price>50")
+        out = m.to_mermaid()
+        assert "&gt;" in out
+        # Make sure raw ">" doesn't appear in the label region.
+        for line in out.splitlines():
+            if "price" in line:
+                # Only the "-->" arrow is allowed to contain ">".
+                assert ">50" not in line.split("-->", 1)[1]
+
+    def test_ampersand_escaped_first(self):
+        # "&" must be replaced before the entities we insert, otherwise
+        # "&amp;#58;" would appear instead of "&amp;" + "&#58;".
+        m = self._machine_with_trigger("a&b:c")
+        out = m.to_mermaid()
+        assert "&amp;" in out
+        assert "&#58;" in out
+        # Must NOT contain double-encoded form.
+        assert "&amp;#58;" not in out
+
+    def test_quote_and_newline_escaped(self):
+        m = self._machine_with_trigger('a"b\nc')
+        out = m.to_mermaid()
+        assert "&quot;" in out
+        assert "<br/>" in out
+
+
+# ─── 1.5.0: Dispatch index preserves observable behavior (bug #6) ──────────
+
+class TestDispatchIndex:
+    def test_available_triggers_preserves_registration_order(self):
+        m = Machine(
+            states=["a", "b", "c"],
+            transitions=[
+                ("zebra", "a", "b"),
+                ("apple", "a", "c"),
+                ("mango", "a", "b"),
+            ],
+            initial="a",
+        )
+        assert m.available_triggers == ["zebra", "apple", "mango"]
+
+    def test_explicit_beats_wildcard_priority(self):
+        # _match_candidates must return explicit-source transitions before
+        # wildcard-source ones. Trigger "go" has both; firing it should land
+        # in "explicit_target" not "wildcard_target".
+        m = Machine(
+            states=["a", "explicit_target", "wildcard_target"],
+            transitions=[
+                ("go", "*", "wildcard_target"),
+                ("go", "a", "explicit_target"),
+            ],
+            initial="a",
+        )
+        m.trigger("go")
+        assert m.state == "explicit_target"
+
+    def test_dispatch_handles_wildcard_only_triggers(self):
+        m = Machine(
+            states=["a", "b"],
+            transitions=[("cancel", "*", "b")],
+            initial="a",
+        )
+        assert "cancel" in m.available_triggers
+        m.trigger("cancel")
+        assert m.state == "b"
+
+
+# ─── 1.5.0: shallow_ctx flag (bug #4) ───────────────────────────────────────
+
+class TestShallowCtx:
+    def test_default_is_deepcopy(self):
+        # Mutating a nested list inside an action and then undoing must
+        # restore the pre-mutation state when shallow_ctx=False (default).
+        def append_to_list(ctx):
+            ctx["items"].append("new")
+
+        m = Machine(
+            states=["a", "b"],
+            transitions=[("go", "a", "b", None, append_to_list)],
+            initial="a",
+            ctx={"items": ["original"]},
+        )
+        m.trigger("go")
+        assert m.ctx["items"] == ["original", "new"]
+        m.undo()
+        assert m.ctx["items"] == ["original"]  # protected by deepcopy
+
+    def test_shallow_ctx_does_not_protect_nested(self):
+        # With shallow_ctx=True, the snapshot aliases the same list object.
+        # Mutating it in-place during action persists across undo. This is
+        # documented behavior — opt-in tradeoff.
+        def append_to_list(ctx):
+            ctx["items"].append("new")
+
+        m = Machine(
+            states=["a", "b"],
+            transitions=[("go", "a", "b", None, append_to_list)],
+            initial="a",
+            ctx={"items": ["original"]},
+            shallow_ctx=True,
+        )
+        m.trigger("go")
+        m.undo()
+        assert m.ctx["items"] == ["original", "new"]  # NOT protected — by design
+
+    def test_shallow_ctx_protects_top_level_keys(self):
+        # Top-level keys (added/removed via dict.update) ARE protected — the
+        # dict() snapshot is its own dict, so undo restores the key set.
+        m = Machine(
+            states=["a", "b"],
+            transitions=[("go", "a", "b")],
+            initial="a",
+            ctx={"x": 1},
+            shallow_ctx=True,
+        )
+        m.trigger("go", y=2)
+        assert m.ctx == {"x": 1, "y": 2}
+        m.undo()
+        assert m.ctx == {"x": 1}
+
+
+# ─── 1.5.0: transition_to (item A) ──────────────────────────────────────────
+
+class TestTransitionTo:
+    def test_basic(self):
+        m = make_order()
+        result = m.transition_to("submitted")
+        assert result == "submitted"
+        assert m.state == "submitted"
+
+    def test_via_wildcard(self):
+        m = Machine(
+            states=["a", "b", "c"],
+            transitions=[
+                ("step", "a", "b"),
+                ("cancel", "*", "c"),
+            ],
+            initial="a",
+        )
+        m.transition_to("c")
+        assert m.state == "c"
+
+    def test_unknown_dest_raises(self):
+        m = make_order()
+        with pytest.raises(InvalidTransition) as exc:
+            m.transition_to("nonexistent")
+        assert exc.value.reason == "unknown_state"
+
+    def test_no_edge_raises(self):
+        m = make_order()  # at "draft"
+        # "approved" is reachable but only from "submitted" — no edge from
+        # current state.
+        with pytest.raises(InvalidTransition) as exc:
+            m.transition_to("approved")
+        assert exc.value.reason == "no_edge"
+
+    def test_guard_blocks_raises_guard_rejected(self):
+        m = make_order()
+        m.trigger("submit")  # at "submitted"
+        # "approve" guard requires score>50; transition_to should fail.
+        with pytest.raises(GuardRejected) as exc:
+            m.transition_to("approved", score=30)
+        assert exc.value.reason == "guard_rejected"
+
+    def test_kwargs_forwarded_to_trigger(self):
+        m = make_order()
+        m.trigger("submit")
+        m.transition_to("approved", score=80)
+        assert m.state == "approved"
+
+    def test_overloaded_trigger_does_not_silently_dispatch_wrong_edge(self):
+        # Two transitions share the trigger name "go" from state "a":
+        # one to "b" (guard: flag=True), one to "c" (no guard, fallback).
+        # Calling trigger("go") with flag=True goes to "b".
+        # Calling transition_to("c") with flag=True must NOT silently fire
+        # the trigger and land in "b" — it must raise.
+        m = Machine(
+            states=["a", "b", "c"],
+            transitions=[
+                ("go", "a", "b", lambda ctx: ctx.get("flag", False)),
+                ("go", "a", "c"),
+            ],
+            initial="a",
+        )
+        # Sanity: trigger("go", flag=True) lands in "b"
+        m2 = Machine(
+            states=["a", "b", "c"],
+            transitions=[
+                ("go", "a", "b", lambda ctx: ctx.get("flag", False)),
+                ("go", "a", "c"),
+            ],
+            initial="a",
+        )
+        m2.trigger("go", flag=True)
+        assert m2.state == "b"
+
+        # transition_to("c") with flag=True: higher-priority edge wins for "b",
+        # so transition_to("c") cannot deterministically reach "c" → raise.
+        with pytest.raises(GuardRejected):
+            m.transition_to("c", flag=True)
+        assert m.state == "a"  # unchanged
+
+    def test_overloaded_trigger_when_higher_priority_edge_blocked(self):
+        # Same setup as above but flag=False — the b-bound edge's guard fails,
+        # so trigger("go") naturally falls through to the c-bound edge.
+        # transition_to("c") should commit.
+        m = Machine(
+            states=["a", "b", "c"],
+            transitions=[
+                ("go", "a", "b", lambda ctx: ctx.get("flag", False)),
+                ("go", "a", "c"),
+            ],
+            initial="a",
+        )
+        m.transition_to("c", flag=False)
+        assert m.state == "c"
+
+
+# ─── 1.5.0: deprecation warnings (#7, #8) ───────────────────────────────────
+
+class TestDeprecationWarnings:
+    def test_load_dict_warns_on_truncation(self):
+        m = Machine(
+            states=["a", "b"],
+            transitions=[("go", "a", "b")],
+            initial="a",
+            history_size=2,
+        )
+        data = {
+            "state": "a",
+            "ctx": {},
+            "history": [
+                {"state": "a", "ctx": {}},
+                {"state": "b", "ctx": {}},
+                {"state": "a", "ctx": {}},
+                {"state": "b", "ctx": {}},
+                {"state": "a", "ctx": {}},
+            ],
+        }
+        with pytest.warns(DeprecationWarning, match="history truncated"):
+            m.load_dict(data)
+        # Truncation still happens (silent → warning, not silent → raise yet).
+        assert len(m.history) == 2
+
+    def test_load_dict_no_warning_when_within_limit(self):
+        m = Machine(
+            states=["a", "b"],
+            transitions=[("go", "a", "b")],
+            initial="a",
+            history_size=5,
+        )
+        data = {
+            "state": "a",
+            "ctx": {},
+            "history": [{"state": "a", "ctx": {}}, {"state": "b", "ctx": {}}],
+        }
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error")  # promote any warning to exception
+            m.load_dict(data)  # must not raise
+
+    def test_from_dict_warns_on_ctx_kwarg(self):
+        with pytest.warns(DeprecationWarning, match="ctx kwarg"):
+            Machine.from_dict(
+                states=["a", "b"],
+                transitions=[("go", "a", "b")],
+                data={"state": "a", "ctx": {"x": 1}, "history": []},
+                ctx={"y": 2},  # ignored, warns
+            )
+
+    def test_from_dict_no_warning_without_ctx_kwarg(self):
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error")
+            Machine.from_dict(
+                states=["a", "b"],
+                transitions=[("go", "a", "b")],
+                data={"state": "a", "ctx": {"x": 1}, "history": []},
+            )
+
+
+# ─── 1.5.0: typed reason field on exceptions (item E) ──────────────────────
+
+class TestExceptionReason:
+    def test_invalid_transition_default_reason(self):
+        m = make_order()
+        with pytest.raises(InvalidTransition) as exc:
+            m.trigger("nonexistent")
+        assert exc.value.reason == "no_edge"
+
+    def test_guard_rejected_default_reason(self):
+        m = make_order()
+        m.trigger("submit")
+        with pytest.raises(GuardRejected) as exc:
+            m.trigger("approve", score=30)
+        assert exc.value.reason == "guard_rejected"
+
+    def test_str_unchanged_for_invalid_transition(self):
+        # Critical for the additive contract: code that parses str(exc) must
+        # continue to work in 1.5.0.
+        m = make_order()
+        try:
+            m.trigger("nonexistent")
+        except InvalidTransition as e:
+            assert str(e) == "No transition 'nonexistent' from state 'draft'"
+
+    def test_str_unchanged_for_guard_rejected(self):
+        m = make_order()
+        m.trigger("submit")
+        try:
+            m.trigger("approve", score=30)
+        except GuardRejected as e:
+            assert str(e) == "Guard rejected 'approve' from 'submitted'"
+
+    def test_transition_to_unknown_state_reason(self):
+        m = make_order()
+        with pytest.raises(InvalidTransition) as exc:
+            m.transition_to("ghost")
+        assert exc.value.reason == "unknown_state"
+
+    def test_reason_is_writable_in_constructor(self):
+        # Subclasses or callers can construct with custom reason.
+        e = InvalidTransition("foo", "bar", reason="unknown_state")
+        assert e.reason == "unknown_state"
+        assert e.trigger == "foo"
+        assert e.state == "bar"
