@@ -1878,3 +1878,150 @@ class TestExceptionReason:
         assert e.reason == "unknown_state"
         assert e.trigger == "foo"
         assert e.state == "bar"
+
+
+# ─── Audit 2026-07 regression anchors (A1/A2/A3) ────────────────────────────
+
+class TestAuditA1HistoryRollback:
+    """A1: a failed transition must fully roll back — including history — even
+    when the history deque is already at maxlen. Previously the len-comparison
+    pop guard failed to fire because append() at maxlen evicts the oldest entry
+    without changing len, leaving a bogus entry and losing a real one."""
+
+    def test_failed_transition_at_maxlen_preserves_history(self):
+        def boom(ctx):
+            raise RuntimeError("enter failed")
+
+        m = Machine(
+            states=["a", "b", "c", "d"],
+            transitions=[("go_b", "a", "b"), ("go_c", "b", "c"), ("go_d", "c", "d")],
+            initial="a",
+            on_enter={"d": boom},
+            history_size=2,
+        )
+        m.trigger("go_b")   # history: [a]
+        m.trigger("go_c")   # history: [a, b] — full at maxlen=2
+        assert m.history == ["a", "b"]
+
+        with pytest.raises(RuntimeError):
+            m.trigger("go_d")   # on_enter(d) raises -> full rollback
+
+        assert m.state == "c"
+        assert m.history == ["a", "b"]      # identical to before the failure
+        assert m.undo() == "b"               # real previous state, not a no-op
+        assert m.undo() == "a"
+
+    def test_failed_transition_at_maxlen_size1(self):
+        def boom(ctx):
+            raise RuntimeError("boom")
+
+        m = Machine(
+            states=["a", "b", "c"],
+            transitions=[("go", "a", "b"), ("fail", "b", "c")],
+            initial="a",
+            on_enter={"c": boom},
+            history_size=1,
+        )
+        m.trigger("go")     # history: [a] — full at maxlen=1
+        with pytest.raises(RuntimeError):
+            m.trigger("fail")
+        assert m.state == "b"
+        assert m.history == ["a"]
+        assert m.undo() == "a"
+
+
+class TestAuditA2LoadDictAtomic:
+    """A2: load_dict must validate before mutating (all-or-nothing) and wrap
+    malformed input in MachineError instead of leaking raw KeyError/TypeError."""
+
+    def _machine(self):
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")],
+                    initial="a", ctx={"keep": "me"})
+        m.trigger("go")
+        return m
+
+    def test_invalid_ctx_type_is_machine_error_and_atomic(self):
+        m = self._machine()
+        before_state, before_ctx = m.state, dict(m.ctx)
+        with pytest.raises(MachineError):
+            m.load_dict({"state": "a", "ctx": 12345, "history": []})
+        assert m.state == before_state       # not committed
+        assert m.ctx == before_ctx           # not wiped
+
+    def test_missing_state_key_is_machine_error(self):
+        m = self._machine()
+        with pytest.raises(MachineError):
+            m.load_dict({"ctx": {}, "history": []})
+
+    def test_non_dict_data_is_machine_error(self):
+        m = self._machine()
+        for bad in ([], "x", 42, None):
+            with pytest.raises(MachineError):
+                m.load_dict(bad)
+
+    def test_history_not_a_list_is_machine_error(self):
+        m = self._machine()
+        with pytest.raises(MachineError):
+            m.load_dict({"state": "a", "ctx": {}, "history": "ab"})
+
+    def test_invalid_history_ctx_type_is_machine_error(self):
+        m = self._machine()
+        with pytest.raises(MachineError):
+            m.load_dict({"state": "a", "ctx": {},
+                         "history": [{"state": "a", "ctx": 5}]})
+
+    def test_uncopyable_ctx_is_machine_error_and_atomic(self):
+        # Blind-review finding: deepcopy of an uncopyable value must surface as
+        # MachineError (not a raw TypeError) and leave the machine untouched.
+        class Boom:
+            def __deepcopy__(self, memo):
+                raise RuntimeError("no copy")
+
+        m = self._machine()
+        before_state, before_ctx = m.state, dict(m.ctx)
+        with pytest.raises(MachineError):
+            m.load_dict({"state": "a", "ctx": {"x": Boom()}, "history": []})
+        assert m.state == before_state
+        assert m.ctx == before_ctx
+        with pytest.raises(MachineError):
+            m.load_dict({"state": "a", "ctx": {},
+                         "history": [{"state": "a", "ctx": {"x": Boom()}}]})
+        assert m.state == before_state
+        assert m.ctx == before_ctx
+
+    def test_parallel_load_dict_atomic_on_region_failure(self):
+        mk_a = lambda: Machine(states=["x", "y"], transitions=[("go", "x", "y")], initial="x")
+        mk_b = lambda: Machine(states=["p", "q"], transitions=[("go", "p", "q")], initial="p")
+        pm = ParallelMachine(rA=mk_a(), rB=mk_b())
+        pm.trigger("go")                      # {rA: y, rB: q}
+        before = pm.state
+        with pytest.raises(MachineError):
+            pm.load_dict({"rA": {"state": "x", "ctx": {}, "history": []},
+                          "rB": {"state": "ZZZ", "ctx": {}, "history": []}})
+        assert pm.state == before             # rA not mutated because rB failed
+
+    def test_parallel_load_dict_non_dict_is_machine_error(self):
+        pm = ParallelMachine(rA=Machine(states=["x"], transitions=[], initial="x"))
+        with pytest.raises(MachineError):
+            pm.load_dict("not a dict")
+
+
+class TestAuditA3LoadDictDeepCopy:
+    """A3: load_dict must deep-copy nested ctx so the input dict cannot alias
+    internal state, matching the documented 'full transactional safety'."""
+
+    def test_nested_ctx_not_aliased(self):
+        data = {"state": "b", "ctx": {"items": [1, 2, 3]}, "history": []}
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+        m.load_dict(data)
+        data["ctx"]["items"].append(999)      # mutate input AFTER load
+        assert m.ctx["items"] == [1, 2, 3]
+
+    def test_nested_history_ctx_not_aliased(self):
+        data = {"state": "b", "ctx": {},
+                "history": [{"state": "a", "ctx": {"items": [1]}}]}
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+        m.load_dict(data)
+        data["history"][0]["ctx"]["items"].append(2)
+        m.undo()
+        assert m.ctx["items"] == [1]

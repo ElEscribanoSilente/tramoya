@@ -74,7 +74,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple, Union
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 __all__ = [
     "Machine", "MachineBuilder", "SubMachine", "ParallelMachine", "WILDCARD",
     "MachineError", "InvalidTransition", "GuardRejected",
@@ -354,7 +354,6 @@ class Machine:
                 return self._state
 
             # Full transition — rollback on failure
-            history_len = len(self._history)
             try:
                 if old_state in self._on_exit:
                     self._on_exit[old_state](self.ctx)
@@ -363,18 +362,20 @@ class Machine:
                     tr.action(self.ctx)
 
                 self._state = tr.dest
-                self._push_history(old_state, old_ctx)
 
                 if tr.dest in self._on_enter:
                     self._on_enter[tr.dest](self.ctx)
             except Exception:
                 self._state = old_state
-                # Only pop if history grew during this transition
-                if len(self._history) > history_len:
-                    self._history.pop()
                 self.ctx.clear()
                 self.ctx.update(old_ctx)
                 raise
+
+            # Transition fully succeeded (incl. on_enter) — only now record the
+            # undo point. Pushing before on_enter corrupted history when the
+            # deque was at maxlen: append() evicts the oldest entry (len
+            # unchanged), so the len-comparison pop never fired on rollback. (A1)
+            self._push_history(old_state, old_ctx)
 
             # Notify outside try block — transition is committed,
             # observer failures must not trigger rollback
@@ -510,28 +511,65 @@ class Machine:
             "history": [{"state": s, "ctx": dict(c)} for s, c in self._history],
         }
 
+    @staticmethod
+    def _deepcopy_ctx(ctx: Dict[str, Any], what: str) -> Dict[str, Any]:
+        """Deep-copy a ctx dict from (untrusted) snapshot input, wrapping copy
+        failures in MachineError so load_dict's contract holds — always
+        MachineError, never a raw exception, and atomic — even for values whose
+        __deepcopy__ raises."""
+        try:
+            return copy.deepcopy(ctx)
+        except Exception as e:
+            raise MachineError(f"{what} is not deep-copyable: {e}") from e
+
     def load_dict(self, data: Dict[str, Any]) -> None:
+        """Restore runtime state from a dict.
+
+        Atomic and defensive: the input is fully validated (and deep-copied)
+        before any attribute is mutated. A malformed snapshot raises
+        MachineError — never a raw KeyError/TypeError — and leaves the machine
+        untouched (A2). Nested ctx values are deep-copied so the input dict
+        cannot alias internal state, honoring the documented transactional
+        safety (A3)."""
+        if not isinstance(data, dict):
+            raise MachineError(f"load_dict expects a dict, got {type(data).__name__}")
+        if "state" not in data:
+            raise MachineError("Missing 'state' in data")
         s = data["state"]
         if not isinstance(s, str) or s not in self._states:
             raise MachineError(f"Unknown state '{s}'")
 
-        # Restore _initial if present (since 1.5.0). Validate against declared
-        # states. Absent in legacy snapshots → leave self._initial untouched.
+        # Validate _initial (if present) into a local — don't mutate self yet.
+        # Absent in legacy snapshots → keep the current initial.
+        new_initial = self._initial
         if "initial" in data:
             init = data["initial"]
             if not isinstance(init, str) or init not in self._states:
                 raise MachineError(f"Unknown initial state '{init}'")
-            self._initial = init
+            new_initial = init
+
+        raw_ctx = data.get("ctx", {})
+        if not isinstance(raw_ctx, dict):
+            raise MachineError(f"'ctx' must be a dict, got {type(raw_ctx).__name__}")
+        new_ctx = self._deepcopy_ctx(raw_ctx, "ctx")  # deep copy up-front (A3), before any mutation (A2)
 
         raw_hist = data.get("history", [])
+        if not isinstance(raw_hist, list):
+            raise MachineError(f"'history' must be a list, got {type(raw_hist).__name__}")
         history: List[Tuple[str, Dict[str, Any]]] = []
         for entry in raw_hist:
             if isinstance(entry, dict):
                 # New format: {"state": "...", "ctx": {...}}
+                if "state" not in entry:
+                    raise MachineError(f"history entry missing 'state': {entry!r}")
                 h = entry["state"]
-                if h not in self._states:
+                if not isinstance(h, str) or h not in self._states:
                     raise MachineError(f"Unknown state '{h}' in history")
-                history.append((h, dict(entry.get("ctx", {}))))
+                h_ctx = entry.get("ctx", {})
+                if not isinstance(h_ctx, dict):
+                    raise MachineError(
+                        f"history entry 'ctx' must be a dict, got {type(h_ctx).__name__}")
+                history.append((h, self._deepcopy_ctx(h_ctx, "history entry 'ctx'")))
             elif isinstance(entry, str):
                 # Legacy format: plain state string (no ctx snapshot)
                 if entry not in self._states:
@@ -540,9 +578,6 @@ class Machine:
             else:
                 raise MachineError(f"Invalid history entry: {entry!r}")
 
-        self._state = s
-        self.ctx.clear()
-        self.ctx.update(data.get("ctx", {}))
         # Truncate to history_size to prevent unbounded memory from untrusted input.
         # 1.5.0: silent truncation is deprecated. 2.0.0 will raise instead.
         if self._history_size > 0 and len(history) > self._history_size:
@@ -554,6 +589,12 @@ class Machine:
             )
             history = history[-self._history_size:]
         maxlen = self._history_size if self._history_size > 0 else None
+
+        # All input validated and copied — commit atomically; nothing below can fail.
+        self._initial = new_initial
+        self._state = s
+        self.ctx.clear()
+        self.ctx.update(new_ctx)
         self._history = deque(history, maxlen=maxlen)
 
     @classmethod
@@ -857,10 +898,24 @@ class ParallelMachine:
         return {name: m.to_dict() for name, m in self._regions.items()}
 
     def load_dict(self, data: Dict[str, Any]) -> None:
-        for name, region_data in data.items():
+        """Restore all regions atomically. Validates region names first, then
+        snapshots every region so a failure partway through (an invalid region
+        payload) rolls all regions back to their pre-call state instead of
+        leaving the composite machine torn (A2)."""
+        if not isinstance(data, dict):
+            raise MachineError(f"load_dict expects a dict, got {type(data).__name__}")
+        for name in data:
             if name not in self._regions:
                 raise MachineError(f"Unknown region '{name}' in data")
-            self._regions[name].load_dict(region_data)
+        # Snapshot every region up-front; restore all if any region fails to load.
+        snapshots = {name: m.to_dict() for name, m in self._regions.items()}
+        try:
+            for name, region_data in data.items():
+                self._regions[name].load_dict(region_data)
+        except Exception:
+            for name, snap in snapshots.items():
+                self._regions[name].load_dict(snap)
+            raise
 
     def __repr__(self) -> str:
         parts = ", ".join(f"{k}={v.state!r}" for k, v in self._regions.items())
