@@ -74,7 +74,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple, Union
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 __all__ = [
     "Machine", "MachineBuilder", "SubMachine", "ParallelMachine", "WILDCARD",
     "MachineError", "InvalidTransition", "GuardRejected",
@@ -258,7 +258,9 @@ class Machine:
     def _notify(self, trigger: str, src: str, dst: str, ctx: Dict[str, Any]) -> None:
         if self._on_transition:
             self._on_transition(trigger, src, dst, ctx)
-        for obs in self._observers:
+        # Iterate a snapshot so an observer that subscribes/unsubscribes during
+        # notification can't corrupt the iteration (skip or double-fire). (M8)
+        for obs in list(self._observers):
             obs(trigger, src, dst, ctx)
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -333,56 +335,65 @@ class Machine:
         for tr in candidates:
             if tr.guard is not None and not tr.guard(frozen):
                 continue
+            return self._execute(tr, name, kwargs)
 
-            # Guard passed — snapshot before mutation, then commit.
-            # shallow_ctx=True swaps deepcopy for dict() — 10-50× cheaper but
-            # nested mutable values are aliased (see Machine.__init__ docstring).
-            old_state = self._state
-            old_ctx = dict(self.ctx) if self._shallow_ctx else copy.deepcopy(self.ctx)
-            self.ctx.update(kwargs)
+        raise GuardRejected(name, self._state)
 
-            # Internal transition: action only, no state change, no enter/exit
-            if tr.dest is None:
-                try:
-                    if tr.action:
-                        tr.action(self.ctx)
-                except Exception:
-                    self.ctx.clear()
-                    self.ctx.update(old_ctx)
-                    raise
-                self._notify(name, old_state, old_state, self.ctx)
-                return self._state
+    def _execute(self, tr: _Transition, name: str, kwargs: Dict[str, Any]) -> str:
+        """Run an already-selected transition whose guard has already passed.
 
-            # Full transition — rollback on failure
+        Shared by trigger() and transition_to() so a transition dispatches with
+        exactly one guard evaluation. transition_to() previously delegated back
+        to trigger(), which re-evaluated the guards; a non-pure guard could then
+        return differently on the second pass and silently land in the wrong
+        state. (M10)"""
+        # Snapshot before mutation, then commit.
+        # shallow_ctx=True swaps deepcopy for dict() — 10-50× cheaper but
+        # nested mutable values are aliased (see Machine.__init__ docstring).
+        old_state = self._state
+        old_ctx = dict(self.ctx) if self._shallow_ctx else copy.deepcopy(self.ctx)
+        self.ctx.update(kwargs)
+
+        # Internal transition: action only, no state change, no enter/exit
+        if tr.dest is None:
             try:
-                if old_state in self._on_exit:
-                    self._on_exit[old_state](self.ctx)
-
                 if tr.action:
                     tr.action(self.ctx)
-
-                self._state = tr.dest
-
-                if tr.dest in self._on_enter:
-                    self._on_enter[tr.dest](self.ctx)
             except Exception:
-                self._state = old_state
                 self.ctx.clear()
                 self.ctx.update(old_ctx)
                 raise
-
-            # Transition fully succeeded (incl. on_enter) — only now record the
-            # undo point. Pushing before on_enter corrupted history when the
-            # deque was at maxlen: append() evicts the oldest entry (len
-            # unchanged), so the len-comparison pop never fired on rollback. (A1)
-            self._push_history(old_state, old_ctx)
-
-            # Notify outside try block — transition is committed,
-            # observer failures must not trigger rollback
-            self._notify(name, old_state, tr.dest, self.ctx)
+            self._notify(name, old_state, old_state, self.ctx)
             return self._state
 
-        raise GuardRejected(name, self._state)
+        # Full transition — rollback on failure
+        try:
+            if old_state in self._on_exit:
+                self._on_exit[old_state](self.ctx)
+
+            if tr.action:
+                tr.action(self.ctx)
+
+            self._state = tr.dest
+
+            if tr.dest in self._on_enter:
+                self._on_enter[tr.dest](self.ctx)
+        except Exception:
+            self._state = old_state
+            self.ctx.clear()
+            self.ctx.update(old_ctx)
+            raise
+
+        # Transition fully succeeded (incl. on_enter) — only now record the undo
+        # point. Pushing before on_enter corrupted history when the deque was at
+        # maxlen: append() evicts the oldest entry (len unchanged), so the
+        # len-comparison pop never fired on rollback. (A1)
+        self._push_history(old_state, old_ctx)
+
+        # Notify outside try block — transition is committed, observer failures
+        # must not trigger rollback.
+        self._notify(name, old_state, tr.dest, self.ctx)
+        return self._state
 
     def trigger_many(self, *triggers: Union[str, Tuple[str, Dict[str, Any]]]) -> str:
         """
@@ -453,7 +464,9 @@ class Machine:
             for tr in self._match_candidates(trigger):
                 if tr.guard is None or tr.guard(frozen):
                     if tr.dest == dest:
-                        return self.trigger(trigger, **kwargs)
+                        # Execute the edge we just selected directly, without a
+                        # second guard evaluation via trigger(). (M10)
+                        return self._execute(tr, trigger, kwargs)
                     break  # Higher-priority edge wins and goes elsewhere — skip this trigger.
 
         raise GuardRejected(f"->{dest}", state)
@@ -490,7 +503,12 @@ class Machine:
     # ── Observers ─────────────────────────────────────────────────────────
 
     def subscribe(self, callback: Callable[..., Any]) -> Callable[..., Any]:
-        """Add observer. callback(trigger, src, dst, ctx). Returns callback for unsubscribe."""
+        """Add observer. callback(trigger, src, dst, ctx). Returns callback for unsubscribe.
+
+        Observers run *after* the transition commits (the state has already
+        changed), so an exception from an observer propagates out of trigger()
+        but does NOT roll the transition back — unlike on_exit/action/on_enter.
+        Keep observers side-effect-tolerant, or guard them internally. (M9)"""
         self._observers.append(callback)
         return callback
 
@@ -503,7 +521,12 @@ class Machine:
         """Serialize runtime state. Includes "initial" since 1.5.0 so that
         round-trips through from_dict() preserve reset() semantics. Older
         snapshots without "initial" remain loadable (initial falls back to
-        the snapshotted state, matching pre-1.5.0 behavior)."""
+        the snapshotted state, matching pre-1.5.0 behavior).
+
+        Only runtime state is serialized — construction knobs (history_size,
+        shallow_ctx) are not. After from_dict()/load_dict(), re-supply them to
+        the constructor if they differ from the defaults, or `==` will report
+        the rebuilt machine unequal. (M5)"""
         return {
             "state": self._state,
             "initial": self._initial,
@@ -530,7 +553,12 @@ class Machine:
         MachineError — never a raw KeyError/TypeError — and leaves the machine
         untouched (A2). Nested ctx values are deep-copied so the input dict
         cannot alias internal state, honoring the documented transactional
-        safety (A3)."""
+        safety (A3).
+
+        Note: a ctx nested far beyond sys.getrecursionlimit() can raise
+        RecursionError from the deep copy (and from_json inherits json.loads'
+        own RecursionError on deeply nested JSON); validate the size/depth of
+        untrusted snapshots before loading. (M4)"""
         if not isinstance(data, dict):
             raise MachineError(f"load_dict expects a dict, got {type(data).__name__}")
         if "state" not in data:
@@ -580,15 +608,24 @@ class Machine:
 
         # Truncate to history_size to prevent unbounded memory from untrusted input.
         # 1.5.0: silent truncation is deprecated. 2.0.0 will raise instead.
-        if self._history_size > 0 and len(history) > self._history_size:
-            warnings.warn(
-                f"history truncated from {len(history)} to {self._history_size} entries; "
-                f"will raise MachineError in tramoya 2.0",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            history = history[-self._history_size:]
-        maxlen = self._history_size if self._history_size > 0 else None
+        maxlen: Optional[int]
+        if self._history_size > 0:
+            if len(history) > self._history_size:
+                warnings.warn(
+                    f"history truncated from {len(history)} to {self._history_size} entries; "
+                    f"will raise MachineError in tramoya 2.0",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                history = history[-self._history_size:]
+            maxlen = self._history_size
+        else:
+            # history_size == 0 → undo disabled (_push_history is a no-op). Drop
+            # any snapshot history instead of loading it unbounded from
+            # (untrusted) input, which the maxlen=None deque would otherwise
+            # accept in full. (M3)
+            history = []
+            maxlen = None
 
         # All input validated and copied — commit atomically; nothing below can fail.
         self._initial = new_initial
@@ -677,8 +714,11 @@ class Machine:
     def to_dot(self, title: str = "machine") -> str:
         """Export to Graphviz DOT format."""
         esc = self._dot_escape
+        # Quote the title: an unquoted DOT id breaks on common titles like
+        # "order-machine" or "my machine", and "{"/"}" could inject graph
+        # structure. _dot_escape already handles the embedded '"' and '\'. (M11)
         lines = [
-            f'digraph {esc(title)} {{',
+            f'digraph "{esc(title)}" {{',
             '  rankdir=LR;',
             '  node [shape=circle];',
             f'  "{esc(self._state)}" [shape=doublecircle, style=filled, fillcolor=lightblue];',
@@ -701,14 +741,40 @@ class Machine:
         lines.append("}")
         return "\n".join(lines)
 
+    def _mermaid_ids(self) -> Dict[str, str]:
+        """Map each state to a unique, Mermaid-safe node id. _mermaid_id is not
+        injective ('a-b' and 'a_b' both sanitize to 'a_b'), which would merge
+        distinct states into one node and misroute edges; on collision append a
+        numeric suffix so ids stay 1:1 with states. Deterministic (sorted). (M12)"""
+        ids: Dict[str, str] = {}
+        used: Set[str] = set()
+        for s in sorted(self._states):
+            base = self._mermaid_id(s)
+            candidate = base
+            i = 2
+            while candidate in used:
+                candidate = f"{base}__{i}"
+                i += 1
+            ids[s] = candidate
+            used.add(candidate)
+        return ids
+
     def to_mermaid(self) -> str:
         """Export to Mermaid stateDiagram-v2 format.
 
-        Trigger names are escaped via _mermaid_label() so characters like ":",
-        "|", "<", ">" don't silently break the render."""
-        mid = self._mermaid_id
+        Node ids are made unique via _mermaid_ids() so distinct states that
+        sanitize to the same id stay separate; a state whose id differs from its
+        name gets an explicit node declaration carrying the real name. Trigger
+        names are escaped via _mermaid_label() so characters like ":", "|", "<",
+        ">" don't silently break the render."""
+        ids = self._mermaid_ids()
         mlabel = self._mermaid_label
         lines = ["stateDiagram-v2"]
+        # Declare nodes whose sanitized id differs from the real name, so the
+        # diagram shows the true name and colliding states stay distinct.
+        for s in sorted(self._states):
+            if ids[s] != s:
+                lines.append(f'    state "{mlabel(s)}" as {ids[s]}')
         for trigger, trans in self._transitions.items():
             for tr in trans:
                 label = mlabel(trigger)
@@ -717,11 +783,11 @@ class Machine:
                 if tr.source == WILDCARD:
                     # Expand wildcard to edges from every state
                     for s in sorted(self._states):
-                        dst = mid(tr.dest) if tr.dest else mid(s)
-                        lines.append(f"    {mid(s)} --> {dst} : {label}")
+                        dst = ids[tr.dest] if tr.dest else ids[s]
+                        lines.append(f"    {ids[s]} --> {dst} : {label}")
                 else:
-                    src = mid(tr.source)
-                    dst = mid(tr.dest) if tr.dest else src
+                    src = ids[tr.source]
+                    dst = ids[tr.dest] if tr.dest else src
                     lines.append(f"    {src} --> {dst} : {label}")
         return "\n".join(lines)
 
@@ -734,13 +800,34 @@ class Machine:
         }
 
     def __eq__(self, other: object) -> bool:
+        """Structural + runtime equality: same state, ctx, history, declared
+        states, transition topology, and construction knobs (history_size,
+        shallow_ctx). Including the knobs means a serialization round-trip that
+        silently dropped them is detectable via `==` (M5).
+
+        Topology compares whether each edge *has* a guard/action, not the
+        callables' behavior: two machines whose guards return differently but
+        match everywhere else compare equal. Comparing callable identity would
+        instead make structurally-identical machines built from separate lambdas
+        unequal, which is rarely what callers want. (M7)"""
         if not isinstance(other, Machine):
             return NotImplemented
         return (self._state == other._state
                 and self.ctx == other.ctx
                 and self._history == other._history
                 and self._states == other._states
+                and self._history_size == other._history_size
+                and self._shallow_ctx == other._shallow_ctx
                 and self._transition_topology() == other._transition_topology())
+
+    # Machine is a mutable entity, so equality-by-value cannot back a stable
+    # by-value hash. Restore *identity* hashing — defining __eq__ otherwise sets
+    # __hash__ to None, making instances unhashable (no set/dict/lru_cache use
+    # at all). Trade-off: hashing by identity while __eq__ compares by value
+    # means two value-equal machines are DISTINCT keys — a set won't dedupe
+    # them and dict lookup by a value-equal (but non-identical) machine won't
+    # hit. Use machines in sets/dicts as identity handles, not value keys. (M6)
+    __hash__ = object.__hash__
 
     def __repr__(self) -> str:
         return f"Machine(state={self._state!r}, triggers={self.available_triggers})"

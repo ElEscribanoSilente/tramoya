@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.5.2
+
+Bug fixes from the 2026-07 adversarial audit (MEDIUM findings). Each ships an
+executed-PoC regression anchor.
+
+### Bug fixes
+
+- **[additive]** `transition_to()` dispatches the selected edge with a single
+  guard evaluation instead of re-evaluating via `trigger()`. A non-pure guard
+  could previously return differently on the second pass and silently land in
+  the wrong state. `trigger()` and `transition_to()` now share an internal
+  `_execute()` helper. (M10)
+- **[additive]** `_notify()` iterates a snapshot of the observer list, so an
+  observer that subscribes/unsubscribes during notification can no longer skip
+  or double-fire another observer. (M8)
+- **[additive]** `to_dot(title)` quotes the title, so titles like
+  `"order-machine"` or `"my machine"` produce valid DOT and `{`/`}` cannot
+  inject graph structure. (M11)
+- **[additive]** `to_mermaid()` assigns unique node ids, so distinct states that
+  sanitize to the same identifier (e.g. `"a-b"` and `"a_b"`) no longer merge
+  into one node; a state whose id differs from its name gets an explicit
+  `state "name" as id` declaration. (M12)
+- **[additive]** `load_dict()` with `history_size=0` (undo disabled) drops
+  snapshot history instead of loading it unbounded from untrusted input. (M3)
+
+### API
+
+- **[additive]** `Machine` is hashable again (identity hash). Defining `__eq__`
+  had set `__hash__` to None, making instances unusable in sets/dicts/lru_cache.
+  Note: hashing is by identity while `__eq__` is by value, so two value-equal
+  machines are distinct keys — use machines as identity handles, not value keys. (M6)
+- **[additive]** `__eq__` also compares `history_size` and `shallow_ctx`, so a
+  serialization round-trip that silently dropped these construction knobs is now
+  detectable via `==`. (M5)
+
+### Documentation
+
+- Documented that `__eq__` compares whether edges *have* guards/actions, not the
+  callables' behavior (M7); that observers run post-commit and their exceptions
+  propagate without rollback (M9); that `to_dict()` does not serialize
+  construction knobs (M5); and that deeply nested ctx can raise `RecursionError`
+  from deep-copy / `json.loads` on untrusted snapshots (M4).
+
 ## 1.5.1
 
 Bug fixes from the 2026-07 adversarial audit. All three were confirmed with
