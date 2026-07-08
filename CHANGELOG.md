@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.5.1
+
+Bug fixes from the 2026-07 adversarial audit. All three were confirmed with
+executed PoCs that are now regression anchors in the test suite.
+
+### Bug fixes
+
+- **[additive]** `trigger()` now records the undo point only after `on_enter`
+  succeeds. Previously, when the history deque was at `maxlen`, a callback that
+  raised during a transition corrupted the undo history — the failed
+  transition's entry was retained and a legitimate one silently lost — because
+  the length comparison used to decide the compensating `pop` never fired
+  (an `append` at `maxlen` evicts the oldest entry without changing the length).
+  Rollback is now genuinely atomic across state, ctx, and history. (A1)
+- **[additive]** `load_dict()` (and `ParallelMachine.load_dict()`) is now
+  atomic: the input is fully validated and deep-copied before any attribute is
+  mutated. Malformed snapshots (non-dict input, missing `"state"`, non-dict
+  `ctx`, non-list `history`, invalid entries, un-deep-copyable ctx) now raise
+  `MachineError` instead of leaking a raw `KeyError`/`TypeError`/`AttributeError`,
+  and leave the machine untouched instead of half-mutated. (A2)
+- **[additive]** `load_dict()` now deep-copies nested `ctx` values (the main ctx
+  and each history entry's ctx). Previously it copied only the top level, so
+  mutating the input dict after loading — or reusing a parsed snapshot across
+  machines — silently aliased and corrupted internal state, contradicting the
+  documented transactional safety. Applies regardless of `shallow_ctx`. (A3)
+
+### Behavior notes
+
+- The A1 fix changes history ordering only in the undocumented, re-entrant case
+  where an `on_enter` callback fires a nested `trigger()`. Non-re-entrant code is
+  unaffected.
+- `ParallelMachine.load_dict()` rollback relies on `deepcopy`; if a region's
+  *live* ctx holds a deliberately un-deep-copyable object, a failed load can
+  still leave regions partially applied (and raises `MachineError`). This cannot
+  occur with JSON-derived snapshots.
+
 ## 1.5.0
 
 Each entry is tagged: **[additive]** (no observable change for existing code),
