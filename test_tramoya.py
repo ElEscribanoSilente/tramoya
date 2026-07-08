@@ -591,7 +591,7 @@ class TestGraphExport:
     def test_to_dot_basic(self):
         m = make_order()
         dot = m.to_dot("test")
-        assert "digraph test {" in dot
+        assert 'digraph "test" {' in dot
         assert "draft" in dot
         assert "submitted" in dot
 
@@ -2025,3 +2025,97 @@ class TestAuditA3LoadDictDeepCopy:
         data["history"][0]["ctx"]["items"].append(2)
         m.undo()
         assert m.ctx["items"] == [1]
+
+
+class TestAuditMediums:
+    """Audit 2026-07 MEDIUM findings (M3, M5-M12), each an executed-PoC anchor."""
+
+    def test_m3_history_size_zero_drops_snapshot_history(self):
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")],
+                    initial="a", history_size=0)
+        m.load_dict({"state": "a", "ctx": {},
+                     "history": [{"state": "a", "ctx": {}} for _ in range(1000)]})
+        assert m.history == []                      # not loaded unbounded
+
+    def test_m6_machine_is_hashable(self):
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+        assert hash(m) == hash(m)
+        assert m in {m}
+        assert {m: 1}[m] == 1
+
+    def test_m6_hash_is_by_identity_not_value(self):
+        # Documented trade-off: hashing is by identity, so two value-equal
+        # machines are distinct keys (a set does not dedupe them by value).
+        m1 = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+        m2 = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+        assert m1 == m2                              # value-equal
+        assert hash(m1) != hash(m2)                  # but hashed by identity
+        assert len({m1, m2}) == 2                    # so a set keeps both
+
+    def test_m7_eq_ignores_guard_behavior(self):
+        # Documented: topology compares has-guard, not guard behavior.
+        m1 = Machine(states=["a", "b"], transitions=[("go", "a", "b", lambda c: True)], initial="a")
+        m2 = Machine(states=["a", "b"], transitions=[("go", "a", "b", lambda c: False)], initial="a")
+        assert m1 == m2
+
+    def test_m5_eq_distinguishes_history_size(self):
+        m1 = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a", history_size=5)
+        m2 = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a", history_size=50)
+        assert m1 != m2
+
+    def test_m5_eq_distinguishes_shallow_ctx(self):
+        m1 = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a", shallow_ctx=True)
+        m2 = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a", shallow_ctx=False)
+        assert m1 != m2
+
+    def test_m8_observer_unsubscribe_during_notify_not_skipped(self):
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+        fired = []
+
+        def obs_a(t, s, d, c):
+            fired.append("A")
+            m.unsubscribe(obs_a)
+
+        def obs_b(t, s, d, c):
+            fired.append("B")
+
+        m.subscribe(obs_a)
+        m.subscribe(obs_b)
+        m.trigger("go")
+        assert fired == ["A", "B"]                   # B not skipped
+
+    def test_m9_observer_exception_propagates_after_commit(self):
+        def boom(t, s, d, c):
+            raise RuntimeError("boom")
+
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+        m.subscribe(boom)
+        with pytest.raises(RuntimeError):
+            m.trigger("go")
+        assert m.state == "b"                        # committed despite raise
+
+    def test_m10_transition_to_single_eval_no_wrong_dest(self):
+        calls = {"n": 0}
+
+        def g(ctx):
+            calls["n"] += 1
+            return calls["n"] == 1                   # True only on first eval
+
+        m = Machine(
+            states=["s", "D", "WRONG"],
+            transitions=[("go", "s", "D", g), ("go", "s", "WRONG", None)],
+            initial="s",
+        )
+        assert m.transition_to("D") == "D"           # not "WRONG"
+        assert calls["n"] == 1                        # single guard evaluation
+
+    def test_m11_to_dot_title_quoted(self):
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+        assert 'digraph "order-machine" {' in m.to_dot("order-machine")
+
+    def test_m12_mermaid_ids_do_not_collide(self):
+        m = Machine(states=["a-b", "a_b"], transitions=[("t", "a-b", "a_b")], initial="a-b")
+        ids = m._mermaid_ids()
+        assert ids["a-b"] != ids["a_b"]              # distinct nodes, not merged
+        mmd = m.to_mermaid()
+        assert 'as ' in mmd                           # real names declared
