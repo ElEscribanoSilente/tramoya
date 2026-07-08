@@ -2119,3 +2119,53 @@ class TestAuditMediums:
         assert ids["a-b"] != ids["a_b"]              # distinct nodes, not merged
         mmd = m.to_mermaid()
         assert 'as ' in mmd                           # real names declared
+
+
+class TestAuditNitpicks:
+    """Audit 2026-07 minor findings that changed code (L3, L4, L6, L8)."""
+
+    def test_l3_baseexception_rolls_back_ctx(self):
+        def boom(ctx):
+            raise KeyboardInterrupt("ctrl-c")
+
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b", None, boom)],
+                    initial="a", ctx={"tag": "start"})
+        with pytest.raises(KeyboardInterrupt):
+            m.trigger("go", tag="mutated")
+        assert m.state == "a"
+        assert m.ctx == {"tag": "start"}             # rolled back despite BaseException
+
+    def test_l4_shadowed_edge_reason_without_guards(self):
+        # Internal edge (dest=None) shadows the explicit edge to D — no guards.
+        m = Machine(states=["s", "D"], transitions=[("go", "s", None), ("go", "s", "D")],
+                    initial="s")
+        with pytest.raises(GuardRejected) as exc:
+            m.transition_to("D")
+        assert exc.value.reason == "no_deterministic_edge"
+
+    def test_l4_guard_rejection_keeps_guard_rejected_reason(self):
+        m = Machine(states=["s", "D"], transitions=[("go", "s", "D", lambda c: False)],
+                    initial="s")
+        with pytest.raises(GuardRejected) as exc:
+            m.transition_to("D")
+        assert exc.value.reason == "guard_rejected"
+
+    def test_l6_unsubscribe_is_idempotent(self):
+        m = Machine(states=["a", "b"], transitions=[("go", "a", "b")], initial="a")
+
+        def cb(t, s, d, c):
+            pass
+
+        m.subscribe(cb)
+        m.unsubscribe(cb)
+        m.unsubscribe(cb)                            # double unsubscribe: no ValueError
+        m.unsubscribe(lambda t, s, d, c: None)       # never subscribed: no ValueError
+
+    def test_l8_submachine_enter_still_clears_ctx(self):
+        inner = Machine(states=["x", "y"], transitions=[("go", "x", "y")], initial="x")
+        sub = SubMachine("proc", inner)
+        inner.ctx["stale"] = 1
+        inner.trigger("go")
+        sub.enter({})                                # reset() clears ctx (dead clear removed)
+        assert inner.ctx == {}
+        assert inner.state == "x"

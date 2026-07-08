@@ -74,7 +74,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple, Union
 
-__version__ = "1.5.2"
+__version__ = "1.5.3"
 __all__ = [
     "Machine", "MachineBuilder", "SubMachine", "ParallelMachine", "WILDCARD",
     "MachineError", "InvalidTransition", "GuardRejected",
@@ -108,8 +108,9 @@ class GuardRejected(MachineError):
     Attributes:
         trigger: Trigger name that was attempted.
         state:   State the machine was in.
-        reason:  Always "guard_rejected". Provided for parity with
-                 InvalidTransition.reason for typed dispatch on errors.
+        reason:  "guard_rejected" from trigger(). transition_to() may instead
+                 raise reason="no_deterministic_edge" when edges to the target
+                 exist but a higher-priority edge shadows them. (L4)
     """
     def __init__(self, trigger: str, state: str, reason: str = "guard_rejected"):
         self.trigger, self.state, self.reason = trigger, state, reason
@@ -324,7 +325,13 @@ class Machine:
 
         Guard evaluation uses a frozen (read-only) view of ctx+kwargs.
         Context is only mutated after a guard passes. If any callback
-        (on_exit, action, on_enter) raises, the entire transition rolls back.
+        (on_exit, action, on_enter) raises, the entire transition rolls back
+        (with shallow_ctx=True, nested mutable ctx values are not restored —
+        see Machine.__init__). (L2)
+
+        Internal transitions (dest=None) apply kwargs to ctx and run the action
+        but record no undo point: their ctx changes are not reverted by a later
+        undo(). (L1)
         """
         frozen = MappingProxyType({**self.ctx, **kwargs})
 
@@ -359,7 +366,10 @@ class Machine:
             try:
                 if tr.action:
                     tr.action(self.ctx)
-            except Exception:
+            except BaseException:
+                # Roll back on ANY raise (incl. KeyboardInterrupt/SystemExit),
+                # then re-raise — honors "any callback raises → full rollback"
+                # without swallowing the exception. (L3)
                 self.ctx.clear()
                 self.ctx.update(old_ctx)
                 raise
@@ -378,7 +388,7 @@ class Machine:
 
             if tr.dest in self._on_enter:
                 self._on_enter[tr.dest](self.ctx)
-        except Exception:
+        except BaseException:  # roll back on ANY raise, then re-raise (L3)
             self._state = old_state
             self.ctx.clear()
             self.ctx.update(old_ctx)
@@ -399,8 +409,10 @@ class Machine:
         """
         Fire multiple triggers in sequence. Returns final state.
         Each element is either a trigger name or (name, kwargs) tuple.
-        NOT atomic: stops and raises on first failure, leaving the machine
-        in the state reached by the last successful trigger.
+        NOT atomic: stops and raises on first failure, leaving the machine in
+        the state reached by the last successful trigger — and ctx carrying the
+        kwargs merged by every step that already ran (including internal steps,
+        which leave no undo point). (L9)
         """
         for t in triggers:
             if isinstance(t, str):
@@ -428,10 +440,12 @@ class Machine:
             InvalidTransition(reason="unknown_state"): `dest` is not declared.
             InvalidTransition(reason="no_edge"):       no edge from current
                                                        state to `dest` exists.
-            GuardRejected(reason="guard_rejected"):    edges exist but no
-                                                       candidate trigger
-                                                       deterministically lands
-                                                       in `dest`.
+            GuardRejected(reason="guard_rejected"):    guards blocked every
+                                                       candidate edge to `dest`.
+            GuardRejected(reason="no_deterministic_edge"): edges to `dest` exist
+                                                       but a higher-priority edge
+                                                       shadows them — no guard
+                                                       need be involved. (L4)
         """
         if dest not in self._states:
             raise InvalidTransition(f"->{dest}", self._state, reason="unknown_state")
@@ -460,6 +474,7 @@ class Machine:
         # by walking _match_candidates in priority order with guards evaluated
         # against a frozen view. Only commit if the winning edge's dest matches.
         frozen = MappingProxyType({**self.ctx, **kwargs})
+        shadowed = False
         for trigger in candidates:
             for tr in self._match_candidates(trigger):
                 if tr.guard is None or tr.guard(frozen):
@@ -467,16 +482,27 @@ class Machine:
                         # Execute the edge we just selected directly, without a
                         # second guard evaluation via trigger(). (M10)
                         return self._execute(tr, trigger, kwargs)
-                    break  # Higher-priority edge wins and goes elsewhere — skip this trigger.
+                    # A guard-passing edge exists but leads elsewhere: this
+                    # trigger is shadowed by a higher-priority edge.
+                    shadowed = True
+                    break
 
-        raise GuardRejected(f"->{dest}", state)
+        # Honest reason: "no_deterministic_edge" when a candidate's winning edge
+        # went elsewhere (shadowing — possibly with no guards at all);
+        # "guard_rejected" only when guards blocked every candidate. (L4)
+        raise GuardRejected(
+            f"->{dest}", state,
+            reason="no_deterministic_edge" if shadowed else "guard_rejected",
+        )
 
     def undo(self) -> str:
         """Revert to previous state and context. No callbacks fired.
 
-        Restores both state and a deep copy of ctx from before the transition.
-        History is a linear stack — branching (redo after undo) is not supported.
-        External side effects (I/O, database writes) are NOT reverted."""
+        Restores both state and ctx from before the transition (a deep copy,
+        unless shallow_ctx=True, in which case nested mutable values are not
+        restored — see Machine.__init__). History is a linear stack — branching
+        (redo after undo) is not supported. External side effects (I/O, database
+        writes) are NOT reverted. (L2)"""
         if not self._history:
             raise MachineError("Nothing to undo")
         state, ctx_snapshot = self._history.pop()
@@ -513,7 +539,11 @@ class Machine:
         return callback
 
     def unsubscribe(self, callback: Callable[..., Any]) -> None:
-        self._observers.remove(callback)
+        """Remove an observer. Idempotent: a no-op if `callback` is not
+        currently subscribed (no ValueError), so double/defensive unsubscribe is
+        safe. (L6)"""
+        if callback in self._observers:
+            self._observers.remove(callback)
 
     # ── Serialization ─────────────────────────────────────────────────────
 
@@ -869,8 +899,7 @@ class SubMachine:
         """Called when parent enters this state. Fully resets inner machine
         (state, history, and ctx). Only copies shared_keys from parent ctx
         if specified."""
-        self.machine.reset()
-        self.machine.ctx.clear()
+        self.machine.reset()  # reset(clear_ctx=True) already clears ctx (L8)
         if self._shared_keys:
             for key in self._shared_keys:
                 if key in ctx:
@@ -946,7 +975,9 @@ class ParallelMachine:
 
         Note: guards are evaluated twice per region (once in can(), once in
         trigger()). Guards must be pure functions — side effects in guards
-        (I/O, counters, logging) will execute twice."""
+        (I/O, counters, logging) will execute twice. Regions fire in insertion
+        order; keep them truly independent (no shared external state read by
+        guards) or the outcome becomes order-dependent. (L5)"""
         fired = False
         for m in self._regions.values():
             if m.can(name, **kwargs):
@@ -1097,7 +1128,10 @@ class MachineBuilder:
     def build(self, **kwargs: Any) -> Machine:
         """Build and return the Machine. Transition order is deterministic:
         plain transitions first (in registration order), then decorator-only
-        transitions (in registration order of first guard or action seen)."""
+        transitions — all guard-only keys (in registration order), then any
+        remaining action-only keys. So for two competing decorator-only edges, a
+        @guard-registered one is ordered before an @on-registered one regardless
+        of which was declared first. (L7)"""
         # Ensure initial state is included
         self.add_states(self._initial)
 

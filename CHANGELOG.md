@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.5.3
+
+Minor fixes and doc clarifications from the 2026-07 adversarial audit (nitpick
+tier). Code fixes ship with regression anchors.
+
+### Bug fixes
+
+- **[additive]** `trigger()`/`transition_to()` roll back on ANY exception,
+  including `BaseException` (e.g. `KeyboardInterrupt`): ctx and state are
+  restored before it propagates. Previously only `Exception` was caught, so a
+  `KeyboardInterrupt` mid-callback left ctx half-mutated. (L3)
+- **[additive]** `transition_to()` raises
+  `GuardRejected(reason="no_deterministic_edge")` when a higher-priority edge
+  shadows the path to the target (no guard involved), instead of the misleading
+  `"guard_rejected"`. Genuine guard blocks still report `"guard_rejected"`. (L4)
+- **[additive]** `unsubscribe()` is idempotent — a no-op instead of raising
+  `ValueError` when the callback isn't subscribed. (L6)
+
+### Internal
+
+- **[additive]** Removed a redundant `ctx.clear()` in `SubMachine.enter()`
+  (`reset()` already clears ctx). No behavior change. (L8)
+
+### Documentation
+
+- Clarified: internal transitions (dest=None) apply kwargs but leave no undo
+  point (L1); `trigger()`/`undo()` rollback does not restore nested ctx values
+  under `shallow_ctx=True` (L2); `ParallelMachine` regions fire in insertion
+  order and must be independent (L5); `MachineBuilder.build()` orders guard-only
+  before action-only decorator edges (L7); `trigger_many()` may leave ctx
+  partially mutated on a mid-sequence failure (L9).
+
 ## 1.5.2
 
 Bug fixes from the 2026-07 adversarial audit (MEDIUM findings). Each ships an
