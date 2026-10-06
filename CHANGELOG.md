@@ -1,5 +1,204 @@
 # Changelog
 
+## 1.6.0
+
+The verification release, part 1: the machine audits its own topology.
+
+### New API
+
+- **[additive]** `Machine.lint(include_info=False)` — static analysis of the
+  trigger topology, returning a list of `LintFinding` (new frozen dataclass,
+  exported). Three kinds: `dead_edge` (warning — an earlier unguarded edge for
+  the same trigger always wins the dispatch, so this edge can provably never
+  fire; covers explicit-vs-explicit, wildcard-vs-wildcard, and wildcards dead
+  because every state has its own unguarded explicit edge; `shadowed_by` names
+  the culprit edge, and is `None` in that last case ("every state has its own
+  unguarded explicit edge"), where no single edge is to blame),
+  `unreachable_state` (warning — BFS from initial over fireable edges only;
+  dead edges grant no reachability, and a wildcard locally shadowed in one
+  state contributes no successor from that state), and
+  `sink_state` (info, opt-in — reachable but nothing leaves it; info because
+  tramoya has no "final" marker and a dead end is often intentional). Guards
+  are opaque to the analysis, so warnings have zero false positives by design;
+  the trade-off is under-reporting (an always-False guard is not detectable
+  statically). `lint()` is pure: never raises, never mutates, deterministic
+  output order (dead edges grouped by trigger in first-registration order, each
+  trigger's edges in registration order; then states sorted by name).
+
+### Bug fixes (adversarial audit 2026-10)
+
+- **[deprecated]** Re-entrancy — calling `trigger()`, `transition_to()`,
+  `undo()` or `reset()` on a machine from inside one of its own callbacks
+  (`on_exit`, action, `on_enter`) — emits `DeprecationWarning` and will raise
+  `MachineError` in tramoya 2.0. It was never supported, only undocumented.
+  (PER-MOT-001)
+- **[additive]** In the auto-transition-on-enter pattern (an `on_enter` that
+  fires the next trigger), history is now chronological and a failing outer
+  callback discards the undo points its nested commits recorded. (behavior
+  change: history came out reversed — `undo()` moved *forward* — and a rolled
+  back transition left phantom entries that `undo()` then landed on, at
+  `history_size` even evicting a real entry.) Observers are notified outside
+  the re-entrancy window, so chaining a transition from an observer stays
+  sequential and warning-free. Cost on the non-reentrant hot path: one
+  counter and one marker, O(1). (PER-MOT-001)
+- **[additive]** `to_dict()` returns a real snapshot: ctx and every history
+  ctx are deep copies (shallow with `shallow_ctx=True`, like every other copy
+  in that mode). (behavior change: it used to return top-level copies whose
+  nested values aliased the live ctx and the undo snapshots, so an in-memory
+  checkpoint changed retroactively when an action mutated a list in place,
+  mutating the returned dict corrupted what `undo()` restored, and
+  `SubMachine.exit()`→`restore()` reloaded state from *after* the exit. A ctx
+  value that cannot be deep-copied now raises `MachineError` from `to_dict()`
+  instead of being silently aliased; `to_json()` is unaffected — it
+  serializes a read-only view and pays no copy.) Cost: `to_dict()` in the
+  default mode is now O(size of ctx × history entries) — measured ~40 ms for
+  50 history entries × 200-item ctx, versus microseconds for the old shallow
+  copy; take in-memory checkpoints sparingly or use `shallow_ctx=True`.
+  (PER-SER-002)
+- **[additive]** Docs: `trigger()`, `can()` and `subscribe()` now state the
+  real scope of the guarantees — the rollback restores state/ctx/history, not
+  the side effects of callbacks that already ran; after a rollback or `undo()`
+  ctx values are the snapshot's copies; ctx must be deep-copyable in the
+  default mode; the guards' read-only view is shallow; an observer that raises
+  stops the notification of the observers after it. Module Limitations list
+  re-entrancy and the deep-copy requirement. (PER-DOC-001)
+- **[additive]** `transition_to()` classifies a trigger as explicit when it has
+  ANY explicit edge from the current state, whatever the registration order of
+  its wildcard edge. (behavior change: with `("t1", "*", "d")` registered before
+  `("t1", "a", "d")` and a later `("t2", "a", "d")`, it used to file `t1` under
+  wildcards and fire `t2` first, contradicting the documented
+  explicit-before-wildcard order.) (PER-MOT-005)
+- **[additive]** `transition_to()` reports `GuardRejected(reason="no_deterministic_edge")`
+  only when the winning edge actually precedes the *first* edge to the target
+  in dispatch order (target edges registered after a passing edge elsewhere are
+  dead by construction, and `lint()` reports them). (behavior change: when a guarded edge to the target came first and a
+  later edge led elsewhere, the guard was what blocked the move, yet it was
+  reported as `"no_deterministic_edge"`; it is now `"guard_rejected"`.)
+  (PER-MOT-004)
+- **[additive]** `Machine.from_dict()` / `from_json()` raise `MachineError` for
+  a non-dict document, a missing `"state"`, or a non-string `"initial"`.
+  (behavior change: these used to leak a raw `KeyError`, `AttributeError` or
+  `TypeError`.) Malformed JSON still raises `json.JSONDecodeError` from
+  `json.loads`, unchanged. (PER-SER-001)
+- **[additive]** `InvalidTransition` and `GuardRejected` implement
+  `__reduce__`, so `pickle`, `copy.copy` and `copy.deepcopy` round-trip them
+  with `trigger`, `state`, `reason` and `str()` intact. (behavior change:
+  rebuilding them used to raise `TypeError`, so an exception kept in `ctx`
+  broke the next `trigger()`, whose snapshot deep-copies ctx.) (PER-MOT-006)
+- **[additive]** A `_Transition` instance passed to `Machine` is registered as
+  its own copy. (behavior change: registering the same instance twice made
+  `lint()`, which keys on `id()`, report a false-positive `dead_edge`.)
+  (PER-LOG-001)
+- **[deprecated]** A state named `"*"` emits `DeprecationWarning`: the name is
+  reserved for wildcard transitions and will raise `MachineError` in tramoya
+  2.0. (PER-MOT-012)
+- **[additive]** `Machine(ctx={})` binds the caller's empty dict by reference,
+  like any non-empty one. (behavior change: `ctx or {}` replaced an empty dict
+  with a fresh one, so the caller's reference silently diverged.) The `ctx`
+  docstring now states that the machine owns and mutates the dict in place and
+  that it must not be shared between machines. (PER-CTX-001)
+- **[breaking-future]** Documented that the keyword names `name` (`trigger`),
+  `trigger` (`can`) and `dest` (`transition_to`) collide with the positional
+  parameter and raise `TypeError`; positional-only parameters are planned for
+  tramoya 2.0. No code change. (PER-MOT-010)
+- **[additive]** Early validation: a non-callable guard or action in a
+  transition tuple, a non-callable `on_enter`/`on_exit` value or
+  `on_transition`, and `subscribe()` of a non-callable now raise `MachineError`
+  immediately (before, the same inputs failed later, at first dispatch).
+  Falsy placeholders (`action=False`, `on_transition=None`/`False`) are still
+  accepted and ignored, as before; `_Transition` instances are validated the
+  same way. (PER-MOT-011)
+- **[deprecated]** A transition tuple with more than 5 elements emits
+  `DeprecationWarning`: the extra elements are ignored today and will raise
+  `MachineError` in tramoya 2.0. (PER-MOT-011)
+- **[additive]** `ParallelMachine.load_dict()` rolls a failed load back by
+  putting the SAME objects back (identity-preserving snapshots of only the
+  regions named in the payload) instead of reloading `to_dict()` deep copies.
+  (behavior change: the rollback could itself fail on a region holding a lock
+  or other un-deep-copyable ctx value, even one the payload never touched,
+  leaving the composite partly loaded and masking the original exception with
+  a "not deep-copyable" error; it also replaced ctx objects with clones, so
+  external references into ctx went stale.) (PER-CMP-006)
+- **[additive]** `Machine.load_dict()` honors `shallow_ctx=True`: ctx and each
+  history entry's ctx are copied with `dict()`, like every other copy in that
+  mode, so `SubMachine.restore()` works with an inner machine whose ctx holds
+  locks or handles. `SubMachine.enter()` assigns `shared_keys` values by
+  reference when the inner machine is `shallow_ctx=True`; otherwise it deep-copies
+  them and raises `MachineError("shared key 'k' is not deep-copyable: ...")`
+  instead of a raw `TypeError`. (behavior change for `shallow_ctx=True`
+  machines: `load_dict` now copies shallowly, consistent with the rest of that
+  mode; CHANGELOG 1.5.1 said it deep-copied regardless.) (PER-SUB-001)
+- **[additive]** Documented that `ParallelMachine.trigger()` is not atomic
+  across regions: regions fire in insertion order and each commits on its own,
+  so if a region's callback raises, the regions fired before it stay committed
+  and the exception propagates (same contract as `trigger_many`). No code
+  change. (PER-CMP-004)
+- **[additive]** `ParallelMachine.trigger()` raises `GuardRejected` (reason
+  `"guard_rejected"`) when no region fires but at least one region has the
+  trigger available; `InvalidTransition` is kept for a trigger no region has.
+  `ParallelMachine.undo(region="")` now raises `MachineError` (unknown region)
+  instead of silently undoing every region; only `region=None` means "all".
+  (behavior change: a guard-blocked trigger used to raise
+  `InvalidTransition(reason="no_edge")` although the edge existed, and
+  `region=""` was treated like `None`; `InvalidTransition` and `GuardRejected`
+  are both `MachineError`, so `except MachineError` is unaffected.)
+  (PER-CMP-005)
+- **[additive]** `MachineBuilder.build()` gives the machine its own copy of the
+  `@enter`/`@exit` hook dicts. (behavior change: the machine aliased the
+  builder's dicts, so a hook registered after `build()` silently replaced or
+  added to the hooks of the machine already built.) (PER-BLD-001)
+- **[deprecated]** Registering a second `@guard` (or `@on` action) for the same
+  `(trigger, source, dest)` edge emits `DeprecationWarning`: the last one wins
+  today and will raise `MachineError` in tramoya 2.0. (PER-BLD-002)
+- **[additive]** `Machine.__eq__` also compares `initial`. (behavior change:
+  machines that differed only in their initial state, e.g. after
+  `reset(other_state)`, compared equal although `reset()` takes them to
+  different states.) (PER-EQU-001)
+- **[additive]** `Machine.load_dict()` validates every history entry first but
+  deep-copies only the entries it keeps. (behavior change: entries beyond
+  `history_size`, or every entry when `history_size=0`, were deep-copied and
+  then discarded, so an un-copyable value in a dropped entry raised
+  `MachineError` and a large dropped history cost a full deep copy; the
+  validation, the truncation `DeprecationWarning` and the `history_size == 0`
+  semantics are unchanged.) (PER-SER-003)
+- **[additive]** Documented that `SubMachine` state is not part of the parent's
+  `to_dict()`/`load_dict()` snapshot: persist the inner machine separately
+  (planned for 1.8). Module `Limitations` and `SubMachine` docstring. No code
+  change. (PER-CMP-003)
+- **[additive]** Documented the exact `shared_keys` contract of `SubMachine`:
+  copied parent->child on `enter()` only (deep copy by default, by reference
+  with `shallow_ctx=True`); nothing is copied back on `exit()`, and `restore()`
+  reloads the inner ctx exactly as saved at `exit()`, shared keys included. No
+  code change. (PER-CMP-002)
+- **[additive]** Docs: README examples now show the real `to_json()` output
+  (`"initial"` included, history as `{"state", "ctx"}` objects) and explain that
+  legacy snapshots with string history still load but `undo()` restores an
+  empty ctx for them; the DOT example shows the quoted `digraph "order_flow"`
+  header; undo restores state AND ctx; the API tables list `transition_to`,
+  `trigger_many`, `subscribe`/`unsubscribe`, `is_stuck`, `to_mermaid`,
+  `from_dict`, `from_json`, `initial` and `states`. `load_dict`'s docstring now
+  says `_deepcopy_ctx` turns a deep-copy `RecursionError` into `MachineError`
+  (only `from_json` propagates `json.loads`' own), and `to_json` documents that
+  ctx must be JSON-native (non-string keys become strings, tuples become lists,
+  NaN is emitted as the non-standard literal, non-serializable values raise
+  `TypeError`). The 1.6.0 `lint()` entry now states its output order and that
+  `shadowed_by` is `None` when every state has its own unguarded explicit edge.
+  (PER-DOC-002)
+- **[additive]** `to_mermaid()` normalizes every line separator (CR, CRLF, VT,
+  FF, NEL, LS, PS) in trigger and state names to `<br/>`. (behavior change: only
+  `\n` was converted, so a bare `\r` or a Unicode separator in a name split the
+  edge line and could inject a second statement into the diagram.)
+  (PER-EXP-001)
+
+### Examples
+
+- `examples/ejemplo_avanzado.py`: the `volver` edge from `combate` to `cueva`
+  could never fire — shadowed by the unguarded edge to `bosque` registered
+  first, so "returning" from a cave fight silently landed in the forest.
+  Found by `Machine.lint()` on its first run over this repo's own examples;
+  fixed with origin-tracking guards. The bug predates lint — the demo script
+  only worked by accident.
+
 ## 1.5.3
 
 Minor fixes and doc clarifications from the 2026-07 adversarial audit (nitpick

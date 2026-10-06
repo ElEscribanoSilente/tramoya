@@ -1,7 +1,7 @@
 # tramoya
 
 **Finite state machines that fit in your head. Pure Python, production-ready.**  
-*Guards · Entry/Exit hooks · Undo history · JSON serialization · Graphviz & Mermaid export · Zero dependencies.*
+*Guards · Entry/Exit hooks · Undo history · JSON serialization · Static lint · Graphviz & Mermaid export · Zero dependencies.*
 
 ```python
 from tramoya import Machine
@@ -40,6 +40,7 @@ State machine libraries in Python fall into two traps: either they demand class 
 | JSON snapshot (runtime state) | ✓ | ✗ | ✗ |
 | Graphviz DOT + Mermaid export | ✓ | ✓ | ✓ |
 | Introspection (can / available) | ✓ | ✓ | partial |
+| Static lint (dead edges, unreachable states) | ✓ | ✗ | ✗ |
 | No class inheritance required | ✓ | partial | ✗ |
 | Dependencies | **0** | 0 | 0 |
 
@@ -218,7 +219,7 @@ order.undo()               # approved → submitted
 order.undo()               # submitted → draft
 ```
 
-Undo reverts the state only — no hooks or actions fire. History tracks up to 50 states by default (configurable via `history_size`).
+Undo restores the previous state and ctx — no hooks or actions fire. History tracks up to 50 states by default (configurable via `history_size`).
 
 ```python
 machine = Machine(..., history_size=100)   # keep 100 undo steps
@@ -234,6 +235,48 @@ machine.can("approve")       # Would this trigger fire? (evaluates guards)
 machine.history              # List of previous states: ["draft"]
 ```
 
+### Static lint — the machine audits itself
+
+`lint()` analyzes the trigger topology and reports defects that are provable
+without running the machine:
+
+```python
+m = Machine(
+    states=["a", "b", "c"],
+    transitions=[
+        ("go", "a", "b"),          # unguarded — always wins "go" from "a"
+        ("go", "a", "c"),          # DEAD: can never fire
+    ],
+    initial="a",
+)
+
+for f in m.lint():
+    print(f.kind, "—", f.message)
+# dead_edge — trigger 'go' from 'a' to 'c' can never fire: shadowed by ...
+# unreachable_state — state 'c' is not reachable from initial state 'a'
+```
+
+Three finding kinds:
+
+| Kind | Severity | Meaning |
+|------|----------|---------|
+| `dead_edge` | warning | An earlier unguarded edge for the same trigger always wins the dispatch — this edge can provably never fire. `shadowed_by` names the culprit (`None` when a wildcard is dead because every state has its own unguarded explicit edge). |
+| `unreachable_state` | warning | No trigger path from `initial` reaches this state (dead edges don't count as paths). |
+| `sink_state` | info | Reachable, but no edge leaves it. Opt-in via `lint(include_info=True)` — a dead end is often an intentional final state. |
+
+Guards are treated as opaque (they might return `False` at runtime), so a
+guarded edge never shadows anything: **warnings have zero false positives by
+design**. The flip side: a guard that always returns `False` is invisible to
+the analysis.
+
+`lint()` is pure — it never raises and never mutates the machine. Wire it into
+a test and your topology stays honest:
+
+```python
+def test_machine_topology_is_clean():
+    assert build_my_machine().lint() == []
+```
+
 ---
 
 ## Serialization
@@ -245,7 +288,7 @@ machine.trigger("submit")
 machine.trigger("approve", score=92)
 
 snapshot = machine.to_json()
-# '{"state": "approved", "ctx": {"score": 92}, "history": ["draft", "submitted"]}'
+# '{"state": "approved", "initial": "draft", "ctx": {"score": 92}, "history": [{"state": "draft", "ctx": {}}, {"state": "submitted", "ctx": {}}]}'
 ```
 
 ### Restore from JSON
@@ -271,9 +314,11 @@ The machine definition (states, transitions, guards) lives in code. Only the run
 ### Dict format
 
 ```python
-machine.to_dict()    # {"state": "...", "ctx": {...}, "history": [...]}
+machine.to_dict()    # {"state": "...", "initial": "...", "ctx": {...}, "history": [{"state": "...", "ctx": {...}}, ...]}
 machine.load_dict(d) # Restore from dict
 ```
+
+Each history entry stores the state AND the ctx to restore on `undo()`. Legacy snapshots — history as a plain list of state names — still load, but they carry no ctx per entry, so `undo()` restores an empty ctx for those entries.
 
 ---
 
@@ -288,9 +333,10 @@ print(machine.to_dot("order_flow"))
 Output:
 
 ```dot
-digraph order_flow {
+digraph "order_flow" {
   rankdir=LR;
-  node [shape=circle]; "draft" [shape=doublecircle, style=filled, fillcolor=lightblue];
+  node [shape=circle];
+  "draft" [shape=doublecircle, style=filled, fillcolor=lightblue];
   "draft" -> "submitted" [label="submit"];
   "submitted" -> "approved" [label="approve [guarded]"];
   "submitted" -> "rejected" [label="reject"];
@@ -472,26 +518,40 @@ save_machine(doc)
 | `on_exit` | `dict[str, callable]` | `{}` | `{state: fn(ctx)}` — run when leaving |
 | `ctx` | `dict` | `{}` | Shared context carried through the machine |
 | `history_size` | `int` | `50` | Max undo steps (0 to disable) |
+| `shallow_ctx` | `bool` | `False` | Snapshot ctx with `dict()` instead of `deepcopy()`: 10-50× faster, nested values unprotected |
+| `on_transition` | `callable` | `None` | Global `callback(trigger, src, dst, ctx)` after every transition |
 
 ### Methods
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `trigger(name, **kwargs)` | `str` | Fire a trigger. Returns new state. |
+| `transition_to(dest, **kwargs)` | `str` | Imperative dispatch: fire whichever trigger leads to `dest` from the current state. Returns new state. |
+| `trigger_many(*triggers)` | `str` | Fire several triggers in sequence; each is a name or a `(name, kwargs)` tuple. Not atomic. Returns the final state. |
 | `can(trigger, **kwargs)` | `bool` | Check if trigger would fire (evaluates guards). |
-| `undo()` | `str` | Revert to previous state. |
+| `is_stuck(**kwargs)` | `bool` | True if no available trigger can actually fire (evaluates guards). |
+| `undo()` | `str` | Revert to previous state and ctx. |
 | `reset(state=None, clear_ctx=True)` | `None` | Reset to a state (default: initial). Clears ctx by default. |
+| `subscribe(callback)` | `callable` | Add an observer `callback(trigger, src, dst, ctx)`, run after each committed transition. Returns the callback. |
+| `unsubscribe(callback)` | `None` | Remove an observer (no-op if it is not subscribed). |
 | `to_dict()` | `dict` | Serialize runtime state. |
 | `load_dict(data)` | `None` | Restore runtime state. |
 | `to_json()` | `str` | Serialize to JSON string. |
+| `from_dict(states, transitions, data, **kwargs)` | `Machine` | Classmethod: rebuild a machine from `to_dict()` output. `kwargs` go to the constructor. |
+| `from_json(states, transitions, json_str, **kwargs)` | `Machine` | Classmethod: same, from a JSON string. |
 | `to_dot(title)` | `str` | Export to Graphviz DOT format. |
+| `to_mermaid()` | `str` | Export to Mermaid `stateDiagram-v2`. |
+| `lint(include_info=False)` | `list[LintFinding]` | Static topology analysis: dead edges, unreachable states, sinks. Pure, never raises. |
 
 ### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `state` | `str` | Current state |
+| `initial` | `str` | Initial state (where `reset()` returns by default) |
+| `states` | `set[str]` | Declared state names (a copy) |
 | `history` | `list[str]` | Previous states (for undo) |
+| `is_final` | `bool` | No trigger is available from the current state (ignores guards) |
 | `available_triggers` | `list[str]` | Triggers valid from current state |
 | `ctx` | `dict` | Shared context dict |
 
