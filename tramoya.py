@@ -18,11 +18,18 @@ What tramoya does:
   ✓ Typed reason field on InvalidTransition / GuardRejected
   ✓ Opt-in shallow ctx snapshots (shallow_ctx=True) for hot paths
   ✓ Precomputed dispatch index — O(1) trigger lookup
+  ✓ Static lint (unreachable states, dead edges, sink states)
 
 Limitations:
   - Not thread-safe: no locking on state/ctx/history mutations
   - No async support: callbacks are synchronous only
   - SubMachine has no automatic done-state propagation to parent
+  - SubMachine state is not part of the parent's to_dict()/load_dict() snapshot:
+    persist the inner machine separately (planned for 1.8)
+  - Not re-entrant: calling trigger()/transition_to()/undo()/reset() from inside
+    a callback emits DeprecationWarning (since 1.6.0) and will raise in 2.0
+  - ctx values must be deep-copyable in the default mode (use shallow_ctx=True
+    for locks, sockets, handles)
 
 Usage:
     from tramoya import Machine
@@ -67,16 +74,18 @@ Author: Independent — not affiliated with any framework.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
+import re
 import warnings
 from collections import deque
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple, Union
 
-__version__ = "1.5.3"
+__version__ = "1.6.0"
 __all__ = [
-    "Machine", "MachineBuilder", "SubMachine", "ParallelMachine", "WILDCARD",
+    "Machine", "LintFinding", "MachineBuilder", "SubMachine", "ParallelMachine", "WILDCARD",
     "MachineError", "InvalidTransition", "GuardRejected",
 ]
 
@@ -102,6 +111,12 @@ class InvalidTransition(MachineError):
         self.trigger, self.state, self.reason = trigger, state, reason
         super().__init__(f"No transition '{trigger}' from state '{state}'")
 
+    def __reduce__(self) -> Tuple[Any, ...]:
+        # args holds only the message (so str() stays unchanged); rebuild via
+        # the real signature so pickle/copy/deepcopy work, and carry __dict__ so
+        # extra attributes set by callers survive the round-trip. (PER-MOT-006)
+        return (type(self), (self.trigger, self.state, self.reason), self.__dict__)
+
 class GuardRejected(MachineError):
     """All candidate transitions for the trigger were blocked by guards.
 
@@ -116,6 +131,12 @@ class GuardRejected(MachineError):
         self.trigger, self.state, self.reason = trigger, state, reason
         super().__init__(f"Guard rejected '{trigger}' from '{state}'")
 
+    def __reduce__(self) -> Tuple[Any, ...]:
+        # args holds only the message (so str() stays unchanged); rebuild via
+        # the real signature so pickle/copy/deepcopy work, and carry __dict__ so
+        # extra attributes set by callers survive the round-trip. (PER-MOT-006)
+        return (type(self), (self.trigger, self.state, self.reason), self.__dict__)
+
 
 # ─── Transition ───────────────────────────────────────────────────────────────
 
@@ -126,6 +147,39 @@ class _Transition:
     dest: Optional[str]                                            # None = internal transition
     guard: Optional[Callable[[Mapping[str, Any]], bool]] = None    # receives read-only view
     action: Optional[Callable[[Dict[str, Any]], Any]] = None       # receives mutable ctx
+
+
+@dataclass(frozen=True)
+class LintFinding:
+    """One static-analysis finding produced by Machine.lint().
+
+    Attributes:
+        kind:        "dead_edge" | "unreachable_state" | "sink_state".
+        severity:    "warning" | "info".
+        message:     Human-readable explanation. NOT a stable contract —
+                     wording may change between versions; assert a loose
+                     substring if you must, never exact equality.
+        state:       Set for unreachable_state / sink_state.
+        trigger:     Set for dead_edge.
+        source:      Set for dead_edge. May be "*" (wildcard).
+        dest:        Set for dead_edge. None means the shadowed edge is an
+                     internal transition.
+        shadowed_by: For dead_edge, the (trigger, source, dest) of the edge
+                     that shadows this one. None when no single edge is
+                     responsible (every state's own explicit edges do the
+                     shadowing instead — see lint() docstring).
+    """
+    kind: str
+    severity: str
+    message: str
+    state: Optional[str] = None
+    trigger: Optional[str] = None
+    source: Optional[str] = None
+    dest: Optional[str] = None
+    shadowed_by: Optional[Tuple[str, str, Optional[str]]] = None
+
+
+_Runtime = Tuple[str, str, Dict[str, Any], Deque[Tuple[str, Dict[str, Any]]]]
 
 
 # ─── Machine ──────────────────────────────────────────────────────────────────
@@ -142,7 +196,10 @@ class Machine:
         on_enter:      Dict of {state: callback(ctx)} run when entering a state.
         on_exit:       Dict of {state: callback(ctx)} run when leaving a state.
         on_transition: Global callback(trigger, src, dst, ctx) on every transition.
-        ctx:           Arbitrary context dict carried through the machine.
+        ctx:           Arbitrary context dict carried through the machine. The
+                       machine takes ownership of this dict and mutates it in
+                       place (trigger, undo, load_dict); never share one dict
+                       between machines — pass `dict(template)` to each.
         history_size:  Max undo steps (0 = disabled).
         shallow_ctx:   If True, ctx snapshots use dict() instead of deepcopy().
                        10-50× faster for large/complex ctx, but mutable values
@@ -169,6 +226,13 @@ class Machine:
         for s in states:
             if not isinstance(s, str) or not s:
                 raise MachineError(f"State names must be non-empty strings, got {s!r}")
+            if s == WILDCARD:
+                warnings.warn(
+                    "state name '*' is reserved for wildcard transitions; "
+                    "will raise MachineError in tramoya 2.0",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )  # (PER-MOT-012)
         if not isinstance(history_size, int) or history_size < 0:
             raise MachineError(f"history_size must be a non-negative integer, got {history_size!r}")
 
@@ -184,21 +248,33 @@ class Machine:
         self._on_transition: Optional[Callable[..., Any]] = on_transition
         self._state: str = initial
         self._initial: str = initial
-        self.ctx: Dict[str, Any] = ctx or {}
+        self.ctx: Dict[str, Any] = ctx if ctx is not None else {}  # (PER-CTX-001)
         self._history: Deque[Tuple[str, Dict[str, Any]]] = deque(maxlen=history_size if history_size > 0 else None)
         self._history_size = history_size
         self._shallow_ctx = shallow_ctx
         self._observers: List[Callable[..., Any]] = []
+        # Re-entrancy bookkeeping: _depth > 0 while a transition's callbacks
+        # run; _pushes counts undo points recorded so far (net of undo()). It is
+        # only ever read as a difference inside one _execute window, so reset()
+        # and load_dict() need not adjust it.
+        self._depth: int = 0
+        self._pushes: int = 0
 
         if initial not in self._states:
             raise MachineError(f"Initial state '{initial}' not in states")
 
-        for key in self._on_enter:
+        for key, cb in self._on_enter.items():
             if key not in self._states:
                 raise MachineError(f"on_enter references unknown state '{key}'")
-        for key in self._on_exit:
+            if not callable(cb):
+                raise MachineError(f"on_enter['{key}'] must be callable")  # (PER-MOT-011)
+        for key, cb in self._on_exit.items():
             if key not in self._states:
                 raise MachineError(f"on_exit references unknown state '{key}'")
+            if not callable(cb):
+                raise MachineError(f"on_exit['{key}'] must be callable")  # (PER-MOT-011)
+        if on_transition and not callable(on_transition):
+            raise MachineError("on_transition must be callable")  # (PER-MOT-011)
 
         for t in transitions:
             self._add_transition(t)
@@ -207,7 +283,13 @@ class Machine:
 
     def _add_transition(self, t: Union[Tuple[Any, ...], _Transition]) -> None:
         if isinstance(t, _Transition):
-            tr = t
+            # Own copy: lint() keys on id(), so the SAME instance registered
+            # twice must become two distinct edges. (PER-LOG-001)
+            tr = dataclasses.replace(t)
+            if tr.guard is not None and not callable(tr.guard):
+                raise MachineError(f"guard for {tr.trigger!r} must be callable, got {tr.guard!r}")
+            if tr.action and not callable(tr.action):
+                raise MachineError(f"action for {tr.trigger!r} must be callable, got {tr.action!r}")
         else:
             if not isinstance(t, (tuple, list)) or len(t) < 3:
                 raise MachineError(
@@ -217,6 +299,18 @@ class Machine:
             trigger, src, dst = t[0], t[1], t[2]
             guard = t[3] if len(t) > 3 else None
             action = t[4] if len(t) > 4 else None
+            # Fail at construction, not at first dispatch. (PER-MOT-011)
+            if guard is not None and not callable(guard):
+                raise MachineError(f"guard for {trigger!r} must be callable, got {guard!r}")
+            if action and not callable(action):  # falsy placeholders stay ignored, as before
+                raise MachineError(f"action for {trigger!r} must be callable, got {action!r}")
+            if len(t) > 5:
+                warnings.warn(
+                    f"transition tuple for {t[0]!r} has {len(t)} elements; extra elements "
+                    f"are ignored and will raise MachineError in tramoya 2.0",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
             tr = _Transition(trigger, src, dst, guard, action)
 
         # Validate: dest must exist (unless internal), source must exist or be wildcard
@@ -255,6 +349,7 @@ class Machine:
     def _push_history(self, state: str, ctx_snapshot: Dict[str, Any]) -> None:
         if self._history_size > 0:
             self._history.append((state, ctx_snapshot))
+            self._pushes += 1
 
     def _notify(self, trigger: str, src: str, dst: str, ctx: Dict[str, Any]) -> None:
         if self._on_transition:
@@ -311,7 +406,10 @@ class Machine:
 
     def can(self, trigger: str, **kwargs: Any) -> bool:
         """Check if trigger can fire (evaluates guards).
-        Guards receive a read-only view of ctx to prevent accidental mutation."""
+        Guards receive a read-only view of ctx to prevent accidental
+        mutation. The view is shallow: top-level assignment raises, but a
+        guard that mutates a nested value in place (ctx["items"].append)
+        does reach the live ctx — keep guards pure."""
         frozen = MappingProxyType({**self.ctx, **kwargs})
         for tr in self._match_candidates(trigger):
             if tr.guard is None or tr.guard(frozen):
@@ -323,15 +421,38 @@ class Machine:
         Fire a trigger. Returns the new state.
         Raises InvalidTransition or GuardRejected.
 
-        Guard evaluation uses a frozen (read-only) view of ctx+kwargs.
-        Context is only mutated after a guard passes. If any callback
-        (on_exit, action, on_enter) raises, the entire transition rolls back
-        (with shallow_ctx=True, nested mutable ctx values are not restored —
-        see Machine.__init__). (L2)
+        Guard evaluation uses a frozen (read-only) view of ctx+kwargs; the
+        view is shallow, so a guard that mutates a nested value in place is
+        not stopped (keep guards pure). Context is only mutated after a guard
+        passes. If any callback (on_exit, action, on_enter) raises, state,
+        ctx and history roll back to their pre-call values (with
+        shallow_ctx=True, nested mutable ctx values are not restored — see
+        Machine.__init__). The rollback covers the machine, not the world:
+        side effects of callbacks that already ran (e.g. on_exit of the old
+        state) are not compensated, and after a rollback or undo() the ctx
+        values are the snapshot's deep copies, not the original objects. In
+        the default mode every ctx value must therefore be deep-copyable (a
+        Lock or socket in ctx makes trigger() raise TypeError; use
+        shallow_ctx=True for such values). (L2)
+
+        Calling trigger()/transition_to()/undo()/reset() on this machine from
+        inside one of its callbacks (re-entrancy) is unsupported: it emits
+        DeprecationWarning since 1.6.0 and will raise MachineError in 2.0.
+        For the common auto-transition-on-enter pattern, history stays
+        chronological and a failing outer callback discards the undo points
+        the nested commits recorded (entries those commits evicted at
+        history_size are gone for good, as with any eviction); re-entering
+        from on_exit/action, or calling reset()/undo() from a callback, is
+        best-effort only.
 
         Internal transitions (dest=None) apply kwargs to ctx and run the action
         but record no undo point: their ctx changes are not reverted by a later
         undo(). (L1)
+
+        The keyword names `name` (trigger), `trigger` (can) and `dest`
+        (transition_to) collide with the positional parameter and raise
+        TypeError; use other ctx keys. Positional-only parameters are planned
+        for 2.0. (PER-MOT-010)
         """
         frozen = MappingProxyType({**self.ctx, **kwargs})
 
@@ -346,6 +467,39 @@ class Machine:
 
         raise GuardRejected(name, self._state)
 
+    def _snapshot_copy(self, ctx: Dict[str, Any], what: str) -> Dict[str, Any]:
+        """Copy of a ctx dict for to_dict(): dict() with shallow_ctx=True,
+        deepcopy otherwise, wrapping copy failures in MachineError (like
+        load_dict) instead of leaking TypeError/RecursionError."""
+        return dict(ctx) if self._shallow_ctx else self._deepcopy_ctx(ctx, what)
+
+    def _runtime_snapshot(self) -> _Runtime:
+        """Identity-preserving capture of (state, initial, ctx, history) for
+        internal restore paths. No nested copies: the point is to put the SAME
+        objects back, so it cannot fail on un-deep-copyable ctx values and
+        external references into ctx stay valid."""
+        return (self._state, self._initial, dict(self.ctx),
+                deque(self._history, maxlen=self._history.maxlen))
+
+    def _runtime_restore(self, snap: _Runtime) -> None:
+        state, initial, ctx, history = snap
+        self._state = state
+        self._initial = initial
+        self.ctx.clear()
+        self.ctx.update(ctx)
+        self._history = history
+
+    def _warn_reentrant(self, what: str, stacklevel: int = 4) -> None:
+        # stacklevel 4 = user callback -> trigger()/transition_to() -> _execute
+        # -> here; undo()/reset() are one frame shallower and pass 3.
+        warnings.warn(
+            f"re-entrant {what} from inside a tramoya callback is unsupported: "
+            f"history/undo and exit/enter ordering are best-effort only; "
+            f"will raise MachineError in tramoya 2.0",
+            DeprecationWarning,
+            stacklevel=stacklevel,
+        )
+
     def _execute(self, tr: _Transition, name: str, kwargs: Dict[str, Any]) -> str:
         """Run an already-selected transition whose guard has already passed.
 
@@ -353,13 +507,33 @@ class Machine:
         exactly one guard evaluation. transition_to() previously delegated back
         to trigger(), which re-evaluated the guards; a non-pure guard could then
         return differently on the second pass and silently land in the wrong
-        state. (M10)"""
+        state. (M10)
+
+        _depth tracks nesting: a callback that triggers this same machine is
+        re-entrant (warned; see trigger()). Observers run after the window
+        closes, so chaining a transition from an observer is sequential."""
+        if self._depth > 0:
+            self._warn_reentrant("trigger()")
+        self._depth += 1
+        try:
+            old_state, dst = self._commit(tr, kwargs)
+        finally:
+            self._depth -= 1
+        # Notify outside any try block — the transition is committed, observer
+        # failures must not trigger rollback.
+        self._notify(name, old_state, dst, self.ctx)
+        return self._state
+
+    def _commit(self, tr: _Transition, kwargs: Dict[str, Any]) -> Tuple[str, str]:
+        """Apply `tr` with full rollback on any raise. Returns (old_state, dst)
+        for the notification; dst == old_state for internal transitions."""
         # Snapshot before mutation, then commit.
         # shallow_ctx=True swaps deepcopy for dict() — 10-50× cheaper but
         # nested mutable values are aliased (see Machine.__init__ docstring).
         old_state = self._state
         old_ctx = dict(self.ctx) if self._shallow_ctx else copy.deepcopy(self.ctx)
         self.ctx.update(kwargs)
+        marker = self._pushes  # undo points past this mark belong to nested commits
 
         # Internal transition: action only, no state change, no enter/exit
         if tr.dest is None:
@@ -370,11 +544,9 @@ class Machine:
                 # Roll back on ANY raise (incl. KeyboardInterrupt/SystemExit),
                 # then re-raise — honors "any callback raises → full rollback"
                 # without swallowing the exception. (L3)
-                self.ctx.clear()
-                self.ctx.update(old_ctx)
+                self._rollback(old_state, old_ctx, marker)
                 raise
-            self._notify(name, old_state, old_state, self.ctx)
-            return self._state
+            return old_state, old_state
 
         # Full transition — rollback on failure
         try:
@@ -389,21 +561,47 @@ class Machine:
             if tr.dest in self._on_enter:
                 self._on_enter[tr.dest](self.ctx)
         except BaseException:  # roll back on ANY raise, then re-raise (L3)
-            self._state = old_state
-            self.ctx.clear()
-            self.ctx.update(old_ctx)
+            self._rollback(old_state, old_ctx, marker)
             raise
 
         # Transition fully succeeded (incl. on_enter) — only now record the undo
         # point. Pushing before on_enter corrupted history when the deque was at
         # maxlen: append() evicts the oldest entry (len unchanged), so the
         # len-comparison pop never fired on rollback. (A1)
-        self._push_history(old_state, old_ctx)
+        if self._pushes == marker or self._history_size == 0:
+            self._push_history(old_state, old_ctx)  # hot path: no nested commits
+        else:
+            self._record_undo_point(old_state, old_ctx, marker)
+        return old_state, tr.dest
 
-        # Notify outside try block — transition is committed, observer failures
-        # must not trigger rollback.
-        self._notify(name, old_state, tr.dest, self.ctx)
-        return self._state
+    def _rollback(self, old_state: str, old_ctx: Dict[str, Any], marker: int) -> None:
+        self._state = old_state
+        self.ctx.clear()
+        self.ctx.update(old_ctx)
+        # Undo points recorded by nested (re-entrant) commits inside the failed
+        # callback describe a transition that no longer happened: drop them.
+        # Pop by count, never by length — at maxlen, append() evicts instead
+        # of growing, so lengths lie.
+        for _ in range(self._pushes - marker):
+            if self._history:
+                self._history.pop()
+                self._pushes -= 1
+
+    def _record_undo_point(self, old_state: str, old_ctx: Dict[str, Any], marker: int) -> None:
+        nested = self._pushes - marker
+        if nested <= 0 or self._history_size == 0:
+            self._push_history(old_state, old_ctx)
+            return
+        # Re-entrant commits during on_enter already recorded their undo
+        # points. Insert ours *before* them so history stays chronological
+        # (A→B→C reads ['A','B'], not ['B','A']) and undo() walks backwards.
+        history = self._history
+        if history.maxlen is not None and len(history) >= history.maxlen:
+            if nested >= len(history):
+                return  # ours would be the oldest entry: evicted on arrival
+            history.popleft()  # make room the way append() would
+        history.insert(len(history) - min(nested, len(history)), (old_state, old_ctx))
+        self._pushes += 1
 
     def trigger_many(self, *triggers: Union[str, Tuple[str, Dict[str, Any]]]) -> str:
         """
@@ -453,20 +651,16 @@ class Machine:
         state = self._state
         # Collect candidate triggers in registration order, dedup, preserving
         # explicit-before-wildcard preference.
-        seen: Set[str] = set()
         explicit_triggers: List[str] = []
         wildcard_triggers: List[str] = []
         for src, trigger in self._reverse_dispatch.get(dest, ()):
-            if trigger in seen:
-                continue
-            if src == state:
+            if src == state and trigger not in explicit_triggers:
                 explicit_triggers.append(trigger)
-                seen.add(trigger)
-            elif src == WILDCARD:
+            elif src == WILDCARD and trigger not in wildcard_triggers:
                 wildcard_triggers.append(trigger)
-                seen.add(trigger)
-
-        candidates = explicit_triggers + wildcard_triggers
+        # A trigger with ANY explicit edge from the current state is explicit,
+        # whatever the registration order of its wildcard edge. (PER-MOT-005)
+        candidates = explicit_triggers + [t for t in wildcard_triggers if t not in explicit_triggers]
         if not candidates:
             raise InvalidTransition(f"->{dest}", state, reason="no_edge")
 
@@ -476,15 +670,21 @@ class Machine:
         frozen = MappingProxyType({**self.ctx, **kwargs})
         shadowed = False
         for trigger in candidates:
-            for tr in self._match_candidates(trigger):
+            cands = self._match_candidates(trigger)
+            first_to_dest = next((i for i, c in enumerate(cands) if c.dest == dest), len(cands))
+            for i, tr in enumerate(cands):
                 if tr.guard is None or tr.guard(frozen):
                     if tr.dest == dest:
                         # Execute the edge we just selected directly, without a
                         # second guard evaluation via trigger(). (M10)
                         return self._execute(tr, trigger, kwargs)
-                    # A guard-passing edge exists but leads elsewhere: this
-                    # trigger is shadowed by a higher-priority edge.
-                    shadowed = True
+                    # A guard-passing edge exists but leads elsewhere: shadowed
+                    # only if it PRECEDES the first edge to dest; a later one
+                    # means the guards on the earlier dest edges are what
+                    # blocked (dest edges after it are dead by construction —
+                    # lint() reports them). (PER-MOT-004)
+                    if i < first_to_dest:
+                        shadowed = True
                     break
 
         # Honest reason: "no_deterministic_edge" when a candidate's winning edge
@@ -503,9 +703,12 @@ class Machine:
         restored — see Machine.__init__). History is a linear stack — branching
         (redo after undo) is not supported. External side effects (I/O, database
         writes) are NOT reverted. (L2)"""
+        if self._depth > 0:
+            self._warn_reentrant("undo()", stacklevel=3)
         if not self._history:
             raise MachineError("Nothing to undo")
         state, ctx_snapshot = self._history.pop()
+        self._pushes -= 1
         self._state = state
         self.ctx.clear()
         self.ctx.update(ctx_snapshot)
@@ -518,6 +721,8 @@ class Machine:
             state:     Target state (default: initial).
             clear_ctx: If True (default), clears ctx. Pass False to preserve ctx.
         """
+        if self._depth > 0:
+            self._warn_reentrant("reset()", stacklevel=3)
         target = self._initial if state is None else state
         if target not in self._states:
             raise MachineError(f"Unknown state '{target}'")
@@ -534,7 +739,11 @@ class Machine:
         Observers run *after* the transition commits (the state has already
         changed), so an exception from an observer propagates out of trigger()
         but does NOT roll the transition back — unlike on_exit/action/on_enter.
-        Keep observers side-effect-tolerant, or guard them internally. (M9)"""
+        Keep observers side-effect-tolerant, or guard them internally. An
+        observer that raises also ends the notification loop: observers
+        registered after it do not see that transition. (M9)"""
+        if not callable(callback):
+            raise MachineError("observer must be callable")  # (PER-MOT-011)
         self._observers.append(callback)
         return callback
 
@@ -556,12 +765,22 @@ class Machine:
         Only runtime state is serialized — construction knobs (history_size,
         shallow_ctx) are not. After from_dict()/load_dict(), re-supply them to
         the constructor if they differ from the defaults, or `==` will report
-        the rebuilt machine unequal. (M5)"""
+        the rebuilt machine unequal. (M5)
+
+        The returned dict is a real snapshot: ctx and every history ctx are
+        deep copies (shallow with shallow_ctx=True, like every other copy in
+        that mode). Mutating it never reaches the live ctx or the undo
+        history, and a snapshot taken before a transition does not change
+        when an action later mutates a nested value in place. A ctx value
+        that cannot be deep-copied raises MachineError (use shallow_ctx=True
+        for locks, sockets, handles). to_json() does not pay this copy: it
+        serializes a read-only view directly (1.6.0)."""
         return {
             "state": self._state,
             "initial": self._initial,
-            "ctx": dict(self.ctx),
-            "history": [{"state": s, "ctx": dict(c)} for s, c in self._history],
+            "ctx": self._snapshot_copy(self.ctx, "ctx"),
+            "history": [{"state": s, "ctx": self._snapshot_copy(c, "history entry 'ctx'")}
+                        for s, c in self._history],
         }
 
     @staticmethod
@@ -578,17 +797,21 @@ class Machine:
     def load_dict(self, data: Dict[str, Any]) -> None:
         """Restore runtime state from a dict.
 
-        Atomic and defensive: the input is fully validated (and deep-copied)
+        Atomic and defensive: the input is fully validated (and copied)
         before any attribute is mutated. A malformed snapshot raises
         MachineError — never a raw KeyError/TypeError — and leaves the machine
         untouched (A2). Nested ctx values are deep-copied so the input dict
         cannot alias internal state, honoring the documented transactional
-        safety (A3).
+        safety (A3); with shallow_ctx=True the copy is shallow, like every
+        other copy in that mode (1.6.0). History entries are validated first
+        and copied only if they are kept: entries dropped by the history_size
+        truncation are never copied. (PER-SER-003)
 
-        Note: a ctx nested far beyond sys.getrecursionlimit() can raise
-        RecursionError from the deep copy (and from_json inherits json.loads'
-        own RecursionError on deeply nested JSON); validate the size/depth of
-        untrusted snapshots before loading. (M4)"""
+        Note: a ctx nested far beyond sys.getrecursionlimit() makes the deep
+        copy hit RecursionError, which _deepcopy_ctx converts into
+        MachineError; only from_json propagates json.loads' own RecursionError
+        on deeply nested JSON. Validate the size/depth of untrusted snapshots
+        before loading. (M4)"""
         if not isinstance(data, dict):
             raise MachineError(f"load_dict expects a dict, got {type(data).__name__}")
         if "state" not in data:
@@ -609,12 +832,16 @@ class Machine:
         raw_ctx = data.get("ctx", {})
         if not isinstance(raw_ctx, dict):
             raise MachineError(f"'ctx' must be a dict, got {type(raw_ctx).__name__}")
-        new_ctx = self._deepcopy_ctx(raw_ctx, "ctx")  # deep copy up-front (A3), before any mutation (A2)
+        # Copy up-front (A3), before any mutation (A2): deep by default, dict() with
+        # shallow_ctx=True. (PER-SUB-001)
+        new_ctx = dict(raw_ctx) if self._shallow_ctx else self._deepcopy_ctx(raw_ctx, "ctx")
 
         raw_hist = data.get("history", [])
         if not isinstance(raw_hist, list):
             raise MachineError(f"'history' must be a list, got {type(raw_hist).__name__}")
-        history: List[Tuple[str, Dict[str, Any]]] = []
+        # First pass only VALIDATES and keeps raw references: nothing is copied
+        # until we know which entries survive the truncation below. (PER-SER-003)
+        pending: List[Tuple[str, Dict[str, Any]]] = []
         for entry in raw_hist:
             if isinstance(entry, dict):
                 # New format: {"state": "...", "ctx": {...}}
@@ -627,12 +854,12 @@ class Machine:
                 if not isinstance(h_ctx, dict):
                     raise MachineError(
                         f"history entry 'ctx' must be a dict, got {type(h_ctx).__name__}")
-                history.append((h, self._deepcopy_ctx(h_ctx, "history entry 'ctx'")))
+                pending.append((h, h_ctx))
             elif isinstance(entry, str):
                 # Legacy format: plain state string (no ctx snapshot)
                 if entry not in self._states:
                     raise MachineError(f"Unknown state '{entry}' in history")
-                history.append((entry, {}))
+                pending.append((entry, {}))
             else:
                 raise MachineError(f"Invalid history entry: {entry!r}")
 
@@ -640,22 +867,30 @@ class Machine:
         # 1.5.0: silent truncation is deprecated. 2.0.0 will raise instead.
         maxlen: Optional[int]
         if self._history_size > 0:
-            if len(history) > self._history_size:
+            if len(pending) > self._history_size:
                 warnings.warn(
-                    f"history truncated from {len(history)} to {self._history_size} entries; "
+                    f"history truncated from {len(pending)} to {self._history_size} entries; "
                     f"will raise MachineError in tramoya 2.0",
                     DeprecationWarning,
                     stacklevel=2,
                 )
-                history = history[-self._history_size:]
+                pending = pending[-self._history_size:]
             maxlen = self._history_size
         else:
             # history_size == 0 → undo disabled (_push_history is a no-op). Drop
             # any snapshot history instead of loading it unbounded from
             # (untrusted) input, which the maxlen=None deque would otherwise
             # accept in full. (M3)
-            history = []
+            pending = []
             maxlen = None
+
+        # Copy only the entries that are kept, same deep/shallow rule as ctx above.
+        # (PER-SER-003)
+        history = [
+            (h, dict(h_ctx) if self._shallow_ctx
+             else self._deepcopy_ctx(h_ctx, "history entry 'ctx'"))
+            for h, h_ctx in pending
+        ]
 
         # All input validated and copied — commit atomically; nothing below can fail.
         self._initial = new_initial
@@ -692,13 +927,38 @@ class Machine:
                 stacklevel=2,
             )
             kwargs.pop("ctx")
+        # Structural validation before touching data: wrong shapes raise
+        # MachineError, never a raw KeyError/AttributeError/TypeError. (PER-SER-001)
+        if not isinstance(data, dict):
+            raise MachineError(f"from_dict expects a dict, got {type(data).__name__}")
+        if "state" not in data:
+            raise MachineError("Missing 'state' in data")
         initial = data.get("initial", data["state"])
+        if not isinstance(initial, str):
+            raise MachineError(f"Unknown initial state '{initial}'")
         m = cls(states=states, transitions=transitions, initial=initial, **kwargs)
         m.load_dict(data)
         return m
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=False)
+        """Serialize to_dict() as a JSON string.
+
+        ctx must be JSON-native: non-string keys become strings, tuples become
+        lists and NaN is emitted as the non-standard literal; non-serializable
+        values raise TypeError from json.dumps. (PER-DOC-002)
+
+        json.dumps never mutates its input and yields its own immutable text,
+        so the deep copy to_dict() makes would be redundant here: serialize a
+        shallow view instead (same output, no copy cost). Note that this does
+        not call to_dict(): a subclass overriding to_dict() must also override
+        to_json() if it wants the two to agree."""
+        view = {
+            "state": self._state,
+            "initial": self._initial,
+            "ctx": self.ctx,
+            "history": [{"state": s, "ctx": c} for s, c in self._history],
+        }
+        return json.dumps(view, ensure_ascii=False)
 
     @classmethod
     def from_json(
@@ -708,6 +968,11 @@ class Machine:
         json_str: str,
         **kwargs: Any,
     ) -> "Machine":
+        """Reconstruct machine from a JSON string (see from_dict).
+
+        Malformed JSON raises `json.JSONDecodeError` (a `ValueError`) from
+        `json.loads`, unchanged; a well-formed document with the wrong structure
+        raises `MachineError` (1.6.0)."""
         return cls.from_dict(states, transitions, json.loads(json_str), **kwargs)
 
     # ── Graph export ──────────────────────────────────────────────────────
@@ -730,8 +995,14 @@ class Machine:
         "price>50" or "foo:bar" silently breaks the render (blank diagram, no
         parse error). HTML entities render correctly in Mermaid output.
 
+        Every line separator (CR, CRLF, VT, FF, NEL, LS, PS) is first
+        normalized to a newline: a bare CR or Unicode separator would otherwise
+        split the edge line and let a trigger name smuggle a second statement
+        into the diagram. (PER-EXP-001)
+
         Replace order matters: "&" first, otherwise the entities we insert
         below would themselves be escaped."""
+        s = re.sub(r"\r\n?|[\x0b\x0c\x85\u2028\u2029]", "\n", s)
         return (s
                 .replace("&", "&amp;")
                 .replace("<", "&lt;")
@@ -821,6 +1092,207 @@ class Machine:
                     lines.append(f"    {src} --> {dst} : {label}")
         return "\n".join(lines)
 
+    # ── Lint ──────────────────────────────────────────────────────────────
+
+    def _lint_candidates(self, state: str, trigger: str) -> List[_Transition]:
+        """L(state, trigger): same "explicit first, then wildcard, each in
+        registration order" list _match_candidates builds for self._state —
+        but for any declared state, since lint() reasons about all of them,
+        not just the live one."""
+        explicit = self._dispatch.get((state, trigger), ())
+        wildcard = self._wildcard_dispatch.get(trigger, ())
+        if not explicit:
+            return list(wildcard)
+        if not wildcard:
+            return list(explicit)
+        return [*explicit, *wildcard]
+
+    @staticmethod
+    def _lint_sweep(
+        edges: List[_Transition], shadow_of: Dict[int, _Transition]
+    ) -> None:
+        """One linear pass over a candidate list: map every edge registered
+        after the list's FIRST unguarded edge to that edge (its shadower).
+        Edges before it are all guarded (alive), and the first unguarded edge
+        itself is never shadowed — nothing before it is unguarded — which is
+        exactly the "first, not nearest" rule lint() documents.
+
+        Keys are id(edge), not the edge: duplicate edges compare equal
+        (frozen dataclass), and only the *second* occurrence is dead."""
+        first: Optional[_Transition] = None
+        for e in edges:
+            if first is not None:
+                shadow_of[id(e)] = first
+            elif e.guard is None:
+                first = e
+
+    def _lint_wildcard_dead_everywhere(self, trigger: str) -> bool:
+        """True iff every declared state has its own unguarded explicit edge
+        for `trigger` — the wildcard can then never win a dispatch from any
+        state, so it's dead even though no single edge shadows it."""
+        return all(
+            any(e.guard is None for e in self._dispatch.get((s, trigger), ()))
+            for s in self._states
+        )
+
+    def _lint_dead_edges(self) -> List[LintFinding]:
+        """dead_edge findings, walked in self._transitions order (trigger
+        insertion order, then each trigger's edges in registration order) —
+        see lint() for the shadowing rule.
+
+        Linear in the number of edges: each candidate list is swept exactly
+        once (_lint_sweep) instead of re-scanning it per edge, and the
+        every-state wildcard check runs at most once per trigger (memoized)
+        instead of once per wildcard edge. Findings still emit in registration
+        order because the emit loop walks `trans`, not the sweep."""
+        findings: List[LintFinding] = []
+        for trigger, trans in self._transitions.items():
+            shadow_of: Dict[int, _Transition] = {}
+            self._lint_sweep(self._wildcard_dispatch.get(trigger, []), shadow_of)
+            for src in {tr.source for tr in trans if tr.source != WILDCARD}:
+                self._lint_sweep(self._dispatch.get((src, trigger), []), shadow_of)
+
+            wc_dead_everywhere: Optional[bool] = None  # lazy: at most one O(V) check per trigger
+            for tr in trans:
+                shadow = shadow_of.get(id(tr))
+                if tr.source == WILDCARD:
+                    if shadow is not None:
+                        findings.append(LintFinding(
+                            kind="dead_edge", severity="warning",
+                            message=(
+                                f"trigger {trigger!r} from '*' to {tr.dest!r} is "
+                                f"always shadowed by an earlier unguarded wildcard "
+                                f"edge (-> {shadow.dest!r})"),
+                            trigger=trigger, source=WILDCARD, dest=tr.dest,
+                            shadowed_by=(shadow.trigger, shadow.source, shadow.dest),
+                        ))
+                        continue
+                    if wc_dead_everywhere is None:
+                        wc_dead_everywhere = self._lint_wildcard_dead_everywhere(trigger)
+                    if wc_dead_everywhere:
+                        findings.append(LintFinding(
+                            kind="dead_edge", severity="warning",
+                            message=(
+                                f"trigger {trigger!r} from '*' to {tr.dest!r} is "
+                                f"shadowed in every state by that state's own "
+                                f"unguarded explicit edge for {trigger!r}"),
+                            trigger=trigger, source=WILDCARD, dest=tr.dest,
+                            shadowed_by=None,
+                        ))
+                elif shadow is not None:
+                    findings.append(LintFinding(
+                        kind="dead_edge", severity="warning",
+                        message=(
+                            f"trigger {trigger!r} from {tr.source!r} to "
+                            f"{tr.dest!r} can never fire: shadowed by an "
+                            f"earlier unguarded edge (-> {shadow.dest!r})"),
+                        trigger=trigger, source=tr.source, dest=tr.dest,
+                        shadowed_by=(shadow.trigger, shadow.source, shadow.dest),
+                    ))
+        return findings
+
+    def _lint_reachability(self) -> Tuple[Set[str], Dict[str, bool]]:
+        """BFS from initial using only fireable-from-s edges (see lint()).
+        Returns (reachable, has_exit): has_exit[s] is True if some fireable
+        edge from s lands in a declared state other than s (self-loops and
+        internal transitions don't count). Computed together so the
+        traversal — and the per-state candidate lookup it needs — runs once
+        and serves both unreachable_state and sink_state."""
+        reachable: Set[str] = {self._initial}
+        has_exit: Dict[str, bool] = {}
+        queue: Deque[str] = deque([self._initial])
+        while queue:
+            s = queue.popleft()
+            exits = False
+            for trigger in self._transitions:
+                blocked = False
+                for tr in self._lint_candidates(s, trigger):
+                    if not blocked:
+                        if tr.dest is not None and tr.dest != s:
+                            exits = True
+                        if tr.dest is not None and tr.dest not in reachable:
+                            reachable.add(tr.dest)
+                            queue.append(tr.dest)
+                    if tr.guard is None:
+                        blocked = True
+            has_exit[s] = exits
+        return reachable, has_exit
+
+    def lint(self, include_info: bool = False) -> List[LintFinding]:
+        """Static analysis of the machine's trigger topology. Pure: never
+        raises, never mutates state/ctx/history/indices, and two consecutive
+        calls return equal lists.
+
+        Mirrors the runtime dispatch rule from _match_candidates: for a given
+        (state, trigger), the first candidate edge with guard=None always
+        wins, so anything registered after it can never fire. A guard is
+        treated as opaque — it might return False at runtime — so a guarded
+        edge never shadows anything. That makes the analysis optimistic: zero
+        false positives by design, but it can under-report (a guard that
+        always returns False is not detectable statically).
+
+        Findings (see LintFinding):
+          - dead_edge (warning): an edge that can never fire because a
+            higher-priority unguarded edge for the same trigger always wins
+            first. For an explicit edge, shadowed_by is the first earlier
+            unguarded edge from the same (source, trigger) — which is, by
+            construction, never itself dead. A wildcard edge is dead when no
+            declared state can ever reach it: either an earlier unguarded
+            wildcard for the same trigger shadows it everywhere
+            (shadowed_by set), or every declared state has its own unguarded
+            explicit edge for that trigger (shadowed_by=None — no single
+            edge is responsible; if both causes apply, the first wins).
+            Internal transitions (dest=None) participate fully: an unguarded
+            internal edge consumes the trigger just like any other, and can
+            itself be dead the same way.
+          - unreachable_state (warning): no path from `initial` reaches this
+            state using only fireable edges. A wildcard edge that is alive
+            globally can still fail to contribute a successor from a
+            specific state where it is locally shadowed by that state's own
+            unguarded explicit edge — the BFS accounts for this per state.
+            `initial` is always reachable.
+          - sink_state (info, only with include_info=True): a reachable
+            state with no fireable edge leading anywhere but itself
+            (self-loops and internal transitions don't count as an exit).
+            Reported as info, not warning: tramoya has no notion of a
+            "final" state, so a dead end may be entirely intentional.
+            Unreachable states are never also reported as sinks (same root
+            cause, reported once as unreachable_state).
+
+        Order: all dead_edge findings first (self._transitions insertion
+        order, then each trigger's edges in registration order), then
+        unreachable_state sorted by state name, then — only with
+        include_info=True — sink_state sorted by state name.
+
+        Args:
+            include_info: If True, also include "info"-severity findings
+                          (currently just sink_state). Default False.
+        """
+        findings = self._lint_dead_edges()
+
+        reachable, has_exit = self._lint_reachability()
+        findings.extend(
+            LintFinding(
+                kind="unreachable_state", severity="warning",
+                message=f"state {s!r} is not reachable from initial state {self._initial!r}",
+                state=s,
+            )
+            for s in sorted(self._states - reachable)
+        )
+
+        if include_info:
+            findings.extend(
+                LintFinding(
+                    kind="sink_state", severity="info",
+                    message=f"state {s!r} is reachable but has no fireable edge leaving it",
+                    state=s,
+                )
+                for s in sorted(reachable)
+                if not has_exit[s]
+            )
+
+        return findings
+
     def _transition_topology(self) -> Dict[str, List[Tuple[str, Optional[str], bool, bool]]]:
         """Extract transition topology for equality comparison.
         Returns {trigger: [(source, dest, has_guard, has_action), ...]}."""
@@ -830,9 +1302,9 @@ class Machine:
         }
 
     def __eq__(self, other: object) -> bool:
-        """Structural + runtime equality: same state, ctx, history, declared
-        states, transition topology, and construction knobs (history_size,
-        shallow_ctx). Including the knobs means a serialization round-trip that
+        """Structural + runtime equality: same state, initial, ctx, history,
+        declared states, transition topology, and construction knobs
+        (history_size, shallow_ctx). Including the knobs means a serialization round-trip that
         silently dropped them is detectable via `==` (M5).
 
         Topology compares whether each edge *has* a guard/action, not the
@@ -843,6 +1315,7 @@ class Machine:
         if not isinstance(other, Machine):
             return NotImplemented
         return (self._state == other._state
+                and self._initial == other._initial  # (PER-EQU-001)
                 and self.ctx == other.ctx
                 and self._history == other._history
                 and self._states == other._states
@@ -887,6 +1360,16 @@ class SubMachine:
         # When parent enters "processing", inner resets to its initial state.
         # Access inner state: sub.machine.state
         # Trigger inner: sub.machine.trigger("go") or sub.trigger("go")
+
+    shared_keys are copied parent→child on enter() only (deep copy in the
+    default mode, by reference with shallow_ctx=True on the inner machine);
+    nothing is copied back to the parent on exit(), and restore() reloads the
+    inner ctx exactly as it was saved at exit(), shared keys included.
+    (PER-CMP-002)
+
+    SubMachine state is not part of the parent's to_dict()/load_dict()
+    snapshot: persist the inner machine separately (planned for 1.8).
+    (PER-CMP-003)
     """
 
     def __init__(self, parent_state: str, machine: Machine, shared_keys: Optional[List[str]] = None):
@@ -903,7 +1386,16 @@ class SubMachine:
         if self._shared_keys:
             for key in self._shared_keys:
                 if key in ctx:
-                    self.machine.ctx[key] = copy.deepcopy(ctx[key])
+                    value = ctx[key]
+                    if self.machine._shallow_ctx:
+                        # By reference, like every copy in shallow_ctx mode. (PER-SUB-001)
+                        self.machine.ctx[key] = value
+                    else:
+                        try:
+                            self.machine.ctx[key] = copy.deepcopy(value)
+                        except Exception as e:
+                            raise MachineError(
+                                f"shared key {key!r} is not deep-copyable: {e}") from e
 
     def exit(self, ctx: Dict[str, Any]) -> None:
         """Called when parent exits this state. Saves inner snapshot."""
@@ -970,8 +1462,14 @@ class ParallelMachine:
 
     def trigger(self, name: str, **kwargs: Any) -> Dict[str, str]:
         """Broadcast trigger to all regions that can handle it.
-        Returns composite state. Raises InvalidTransition only if
-        NO region can handle the trigger.
+        Returns composite state. Raises InvalidTransition if NO region has the
+        trigger, GuardRejected if some region has it but its guards blocked it
+        (PER-CMP-005).
+
+        Not atomic across regions: regions fire in insertion order and each
+        commits on its own. If a region's callback raises, the regions fired
+        before it stay committed and the exception propagates — same contract
+        as trigger_many (L9). (PER-CMP-004)
 
         Note: guards are evaluated twice per region (once in can(), once in
         trigger()). Guards must be pure functions — side effects in guards
@@ -985,6 +1483,8 @@ class ParallelMachine:
                 fired = True
         if not fired:
             states = ", ".join(f"{k}={v.state}" for k, v in self._regions.items())
+            if any(name in m.available_triggers for m in self._regions.values()):
+                raise GuardRejected(name, f"[{states}]")  # (PER-CMP-005)
             raise InvalidTransition(name, f"[{states}]")
         return self.state
 
@@ -996,8 +1496,8 @@ class ParallelMachine:
 
     def undo(self, region: Optional[str] = None) -> Dict[str, str]:
         """Undo last transition. If region specified, undo only that region.
-        Otherwise undo ALL regions (each one step back)."""
-        if region:
+        Otherwise (region=None) undo ALL regions (each one step back)."""
+        if region is not None:  # (PER-CMP-005): "" is an unknown region, not "all"
             if region not in self._regions:
                 raise MachineError(f"Unknown region '{region}'")
             self._regions[region].undo()
@@ -1017,22 +1517,31 @@ class ParallelMachine:
 
     def load_dict(self, data: Dict[str, Any]) -> None:
         """Restore all regions atomically. Validates region names first, then
-        snapshots every region so a failure partway through (an invalid region
-        payload) rolls all regions back to their pre-call state instead of
-        leaving the composite machine torn (A2)."""
+        takes an identity-preserving snapshot of each region named in `data`
+        (no deepcopy), so a failure partway through (an invalid region payload)
+        puts the regions already loaded back to their pre-call state — the SAME
+        ctx objects, not clones — instead of leaving the composite machine torn
+        (A2). Regions not named in `data` are never touched or copied, so an
+        un-deep-copyable ctx value elsewhere cannot break the rollback.
+        (PER-CMP-006)"""
         if not isinstance(data, dict):
             raise MachineError(f"load_dict expects a dict, got {type(data).__name__}")
         for name in data:
             if name not in self._regions:
                 raise MachineError(f"Unknown region '{name}' in data")
-        # Snapshot every region up-front; restore all if any region fails to load.
-        snapshots = {name: m.to_dict() for name, m in self._regions.items()}
+        snapshots = {name: self._regions[name]._runtime_snapshot() for name in data}
+        loaded: List[str] = []
         try:
             for name, region_data in data.items():
                 self._regions[name].load_dict(region_data)
-        except Exception:
-            for name, snap in snapshots.items():
-                self._regions[name].load_dict(snap)
+                loaded.append(name)
+        except BaseException:
+            # Put the SAME objects back (no deepcopy): cannot fail on
+            # un-deep-copyable ctx values and keeps external references into
+            # ctx valid; only regions already loaded need restoring, each
+            # Machine.load_dict is atomic on its own. (PER-CMP-006)
+            for name in loaded:
+                self._regions[name]._runtime_restore(snapshots[name])
             raise
 
     def __repr__(self) -> str:
@@ -1090,14 +1599,30 @@ class MachineBuilder:
     def on(self, trigger: str, source: str, dest: Optional[str]) -> Callable[..., Any]:
         """Decorator: register action for a transition."""
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._actions[(trigger, source, dest)] = fn
+            key = (trigger, source, dest)
+            if key in self._actions:
+                warnings.warn(
+                    f"action for {key!r} already registered; the last one wins — "
+                    f"will raise MachineError in tramoya 2.0",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )  # (PER-BLD-002)
+            self._actions[key] = fn
             return fn
         return decorator
 
     def guard(self, trigger: str, source: str, dest: Optional[str]) -> Callable[..., Any]:
         """Decorator: register guard for a transition."""
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._guards[(trigger, source, dest)] = fn
+            key = (trigger, source, dest)
+            if key in self._guards:
+                warnings.warn(
+                    f"guard for {key!r} already registered; the last one wins — "
+                    f"will raise MachineError in tramoya 2.0",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )  # (PER-BLD-002)
+            self._guards[key] = fn
             return fn
         return decorator
 
@@ -1165,8 +1690,10 @@ class MachineBuilder:
             states=self._states,
             transitions=transitions,  # type: ignore[arg-type]
             initial=self._initial,
-            on_enter=self._on_enter or None,
-            on_exit=self._on_exit or None,
+            # Own copies: Machine keeps the dict it is given, so a hook
+            # registered after build() must not leak into it. (PER-BLD-001)
+            on_enter=dict(self._on_enter) or None,
+            on_exit=dict(self._on_exit) or None,
             on_transition=self._on_transition,
             **kwargs,
         )

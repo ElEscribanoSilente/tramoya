@@ -69,6 +69,26 @@ def necesita_nivel(ctx):
 def jefe_derrotado(ctx):
     return ctx.get("jefe_derrotado", False)
 
+# "volver" regresa a donde estabas cuando salto el encuentro. Sin estos guards,
+# la arista a "cueva" seria codigo muerto: la de "bosque", sin guard y
+# registrada antes, ganaria siempre (Machine.lint() lo detecta como dead_edge).
+
+@b.on("encuentro", "bosque", "combate")
+def origen_bosque(ctx):
+    ctx["origen"] = "bosque"
+
+@b.on("encuentro", "cueva", "combate")
+def origen_cueva(ctx):
+    ctx["origen"] = "cueva"
+
+@b.guard("volver", "combate", "bosque")
+def volvia_del_bosque(ctx):
+    return ctx.get("origen") == "bosque"
+
+@b.guard("volver", "combate", "cueva")
+def volvia_de_la_cueva(ctx):
+    return ctx.get("origen") == "cueva"
+
 @b.enter("pueblo")
 def descansar(ctx):
     ctx["hp"] = ctx["max_hp"]
@@ -202,8 +222,8 @@ print(f"\n{stats()}")
 print(f"\n  Puede entrar al jefe? {juego.can('entrar_jefe')}")
 print(f"  Stuck? {juego.is_stuck()}")
 
-# Volver al pueblo a descansar
-juego.trigger("retroceder")
+# Volver al pueblo a descansar (desde la cueva son dos pasos)
+juego.trigger_many("retroceder", "retroceder")
 juego.trigger("descansar")
 print(f"\n{stats()}")
 

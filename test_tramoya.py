@@ -1,11 +1,17 @@
 """Tests for tramoya.py — comprehensive coverage."""
 
+import copy
 import json
+import pickle
+import threading
+import warnings
 import pytest
 from tramoya import (
-    Machine, MachineBuilder, SubMachine, ParallelMachine, WILDCARD,
+    Machine, MachineBuilder, SubMachine, ParallelMachine,
     MachineError, InvalidTransition, GuardRejected,
 )
+from tramoya import LintFinding
+from tramoya import _Transition
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -934,7 +940,6 @@ class TestBuilderDeterminism:
 
     def test_builder_guard_vs_plain_order(self):
         """Guard-only transitions come after plain transitions."""
-        log = []
         b = MachineBuilder("a")
         b.add_states("a", "b", "c")
 
@@ -2169,3 +2174,1062 @@ class TestAuditNitpicks:
         sub.enter({})                                # reset() clears ctx (dead clear removed)
         assert inner.ctx == {}
         assert inner.state == "x"
+
+
+# ─── 1.6.0: Machine.lint() — dead edges ─────────────────────────────────────
+
+class TestLintDeadEdges:
+    """lint() dead_edge findings (spec §3.1): explicit/wildcard shadowing,
+    internal edges, and the 'shadowed_by edge is never itself dead' invariant."""
+
+    def test_e3_dead_edge_shadowed_explicit(self):
+        m = Machine(states=["a", "b", "c"],
+                    transitions=[("go", "a", "b"), ("go", "a", "c")],
+                    initial="a")
+        findings = m.lint()
+        assert len(findings) == 2
+        dead, unreach = findings
+
+        assert dead.kind == "dead_edge"
+        assert dead.severity == "warning"
+        assert dead.trigger == "go"
+        assert dead.source == "a"
+        assert dead.dest == "c"
+        assert dead.shadowed_by == ("go", "a", "b")
+        assert dead.state is None
+
+        assert unreach.kind == "unreachable_state"
+        assert unreach.severity == "warning"
+        assert unreach.state == "c"
+        assert unreach.trigger is None
+        assert unreach.source is None
+        assert unreach.dest is None
+        assert unreach.shadowed_by is None
+
+    def test_e4_guarded_edge_does_not_shadow(self):
+        m = Machine(states=["a", "b", "c"],
+                    transitions=[("go", "a", "b", lambda ctx: True), ("go", "a", "c")],
+                    initial="a")
+        assert m.lint() == []                    # guard is opaque: no shadowing, c reachable
+
+    def test_e5_wildcard_dead_shadowed_by_every_state_explicit(self):
+        m = Machine(states=["a", "b"],
+                    transitions=[("t", "a", "b"), ("t", "b", "a"), ("t", "*", "a")],
+                    initial="a")
+        findings = m.lint()
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.kind == "dead_edge"
+        assert f.trigger == "t"
+        assert f.source == "*"
+        assert f.dest == "a"
+        assert f.shadowed_by is None              # case (b): no single shadowing edge
+        assert not any(x.kind == "unreachable_state" for x in findings)
+        # No sinks either: a and b exit to each other, so include_info adds nothing.
+        assert m.lint(include_info=True) == findings
+
+    def test_e7_wildcard_dead_shadowed_by_earlier_wildcard(self):
+        m = Machine(states=["a", "b"],
+                    transitions=[("t", "*", "a"), ("t", "*", "b")],
+                    initial="a")
+        findings = m.lint()
+        assert len(findings) == 2
+        dead, unreach = findings
+        assert dead.kind == "dead_edge"
+        assert dead.trigger == "t"
+        assert dead.source == "*"
+        assert dead.dest == "b"
+        assert dead.shadowed_by == ("t", "*", "a")
+        assert unreach.kind == "unreachable_state"
+        assert unreach.state == "b"
+
+        findings_info = m.lint(include_info=True)
+        assert len(findings_info) == 3
+        dead2, unreach2, sink = findings_info
+        assert dead2.kind == "dead_edge"
+        assert dead2.dest == "b"
+        assert unreach2.kind == "unreachable_state"
+        assert unreach2.state == "b"
+        assert sink.kind == "sink_state"
+        assert sink.state == "a"                  # self-loop only, rescued nothing
+
+    def test_e8a_internal_edge_shadows_following_explicit(self):
+        m = Machine(states=["a", "b"],
+                    transitions=[("t", "a", None), ("t", "a", "b")],
+                    initial="a")
+        findings = m.lint()
+        assert len(findings) == 2
+        dead, unreach = findings
+        assert dead.kind == "dead_edge"
+        assert dead.trigger == "t"
+        assert dead.source == "a"
+        assert dead.dest == "b"
+        assert dead.shadowed_by == ("t", "a", None)
+        assert unreach.kind == "unreachable_state"
+        assert unreach.state == "b"
+
+    def test_e8b_internal_edge_itself_dead(self):
+        m = Machine(states=["a", "b"],
+                    transitions=[("t", "a", "b"), ("t", "a", None)],
+                    initial="a")
+        findings = m.lint()
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.kind == "dead_edge"
+        assert f.trigger == "t"
+        assert f.source == "a"
+        assert f.dest is None
+        assert f.shadowed_by == ("t", "a", "b")
+
+    def test_duplicate_identical_edges_second_is_dead(self):
+        m = Machine(states=["a", "b"],
+                    transitions=[("t", "a", "b"), ("t", "a", "b")],
+                    initial="a")
+        findings = m.lint()
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.kind == "dead_edge"
+        assert f.trigger == "t"
+        assert f.source == "a"
+        assert f.dest == "b"
+        assert f.shadowed_by == ("t", "a", "b")   # shadowed by the first (identical) edge
+
+    def test_shadowed_by_edge_is_never_itself_dead_three_edges(self):
+        # Three unguarded edges on the same (trigger, source): only the first
+        # is live. shadowed_by must always cite the first, never the nearest,
+        # and the cited edge itself must never appear among the dead ones.
+        m = Machine(states=["a", "b", "c", "d"],
+                    transitions=[("t", "a", "b"), ("t", "a", "c"), ("t", "a", "d")],
+                    initial="a")
+        dead_edges = [f for f in m.lint() if f.kind == "dead_edge"]
+        assert len(dead_edges) == 2
+        for f in dead_edges:
+            assert f.shadowed_by == ("t", "a", "b")
+        dead_signatures = {(f.trigger, f.source, f.dest) for f in dead_edges}
+        assert ("t", "a", "b") not in dead_signatures
+
+
+# ─── 1.6.0: Machine.lint() — reachability ───────────────────────────────────
+
+class TestLintReachability:
+    """lint() unreachable_state findings (spec §3.2): BFS over disparable
+    edges only, with per-state (not global) wildcard shadowing."""
+
+    def test_e2_unreachable_state_and_sink_dedup(self):
+        m = Machine(states=["a", "b", "c"], transitions=[("go", "a", "b")], initial="a")
+        findings = m.lint()
+        assert len(findings) == 1
+        assert findings[0].kind == "unreachable_state"
+        assert findings[0].state == "c"
+
+        findings_info = m.lint(include_info=True)
+        assert len(findings_info) == 2
+        unreach, sink = findings_info
+        assert unreach.kind == "unreachable_state"
+        assert unreach.state == "c"
+        assert sink.kind == "sink_state"
+        assert sink.state == "b"                  # no sink for c: dedup against unreachable
+
+    def test_e6_wildcard_reaches_further_state(self):
+        m = Machine(states=["a", "b", "c"],
+                    transitions=[("t", "a", "b"), ("t", "*", "c")],
+                    initial="a")
+        assert m.lint() == []                     # wildcard alive from b and c
+        findings = m.lint(include_info=True)
+        assert len(findings) == 1
+        assert findings[0].kind == "sink_state"
+        assert findings[0].state == "c"
+
+    def test_e7bis_wildcard_locally_shadowed_not_globally_dead(self):
+        m = Machine(states=["a", "c"],
+                    transitions=[("t", "a", "a"), ("t", "*", "c")],
+                    initial="a")
+        findings = m.lint()
+        assert len(findings) == 1
+        assert findings[0].kind == "unreachable_state"
+        assert findings[0].state == "c"
+        assert not any(f.kind == "dead_edge" for f in findings)  # wildcard alive from c
+
+
+# ─── 1.6.0: Machine.lint() — sinks ──────────────────────────────────────────
+
+class TestLintSinks:
+    """lint() sink_state findings (spec §3.3): info-only, reachable states
+    with no disparable escape edge; deduped against unreachable_state."""
+
+    def test_e1_clean_order_machine_only_sink_with_info(self):
+        m = make_order()
+        assert m.lint() == []
+        findings = m.lint(include_info=True)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.kind == "sink_state"
+        assert f.severity == "info"
+        assert f.state == "approved"
+        assert f.trigger is None
+        assert f.source is None
+        assert f.dest is None
+        assert f.shadowed_by is None
+
+    def test_e9_self_loop_only_is_sink_with_info(self):
+        m = Machine(states=["x"], transitions=[("spin", "x", "x")], initial="x")
+        assert m.lint() == []
+        findings = m.lint(include_info=True)
+        assert len(findings) == 1
+        assert findings[0].kind == "sink_state"
+        assert findings[0].state == "x"
+
+    def test_no_transitions_machine_only_initial_is_sink(self):
+        m = Machine(states=["a"], transitions=[], initial="a")
+        assert m.lint() == []
+        findings = m.lint(include_info=True)
+        assert len(findings) == 1
+        assert findings[0].kind == "sink_state"
+        assert findings[0].state == "a"
+
+
+# ─── 1.6.0: Machine.lint() — contract ───────────────────────────────────────
+
+class TestLintContract:
+    """lint() cross-cutting contract: purity, determinism, ordering, __all__
+    export, frozen findings, include_info default, and the E12 demo machine."""
+
+    def test_e10_lint_is_pure(self):
+        m = make_order()
+        m.trigger("submit")
+        m.trigger("approve", score=80)
+        snapshot = make_order()
+        snapshot.trigger("submit")
+        snapshot.trigger("approve", score=80)
+        assert m == snapshot
+
+        before_state, before_ctx = m.state, dict(m.ctx)
+        before_history = list(m.history)
+        m.lint(include_info=True)
+        assert m.state == before_state
+        assert m.ctx == before_ctx
+        assert m.history == before_history
+        assert m == snapshot                      # still value-equal to the untouched copy
+
+    def test_two_consecutive_calls_return_equal_lists(self):
+        m = Machine(states=["a", "b"],
+                    transitions=[("t", "*", "a"), ("t", "*", "b")],
+                    initial="a")
+        assert m.lint(include_info=True) == m.lint(include_info=True)
+
+    def test_ordering_dead_edge_then_unreachable_then_sink_alphabetical(self):
+        # Registration order is s0, zeta, alpha but unreachable/sink findings
+        # must sort by state name, not registration order (spec §4).
+        m = Machine(states=["s0", "zeta", "alpha"], transitions=[], initial="s0")
+        findings = m.lint(include_info=True)
+        assert len(findings) == 3
+        first, second, third = findings
+        assert first.kind == "unreachable_state"
+        assert first.state == "alpha"
+        assert second.kind == "unreachable_state"
+        assert second.state == "zeta"
+        assert third.kind == "sink_state"
+        assert third.state == "s0"
+
+    def test_e11_lintfinding_exported_in_all(self):
+        import tramoya
+        assert "LintFinding" in tramoya.__all__
+
+    def test_e11_lintfinding_raises_frozen_instance_error_on_mutation(self):
+        import dataclasses
+        f = LintFinding(kind="dead_edge", severity="warning", message="unused")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            f.kind = "sink_state"
+
+    def test_e12_demo_machine_wildcard_rescues_from_sink(self):
+        # Reconstruction (spec E12) of the tramoya.py __main__ demo: the order
+        # machine plus a cancel wildcard to rejected and a log wildcard
+        # internal transition — 6 transitions total, nothing left dangling.
+        m = Machine(
+            states=["draft", "submitted", "approved", "rejected"],
+            transitions=[
+                ("submit",  "draft",     "submitted"),
+                ("approve", "submitted", "approved", lambda ctx: ctx.get("score", 0) > 50),
+                ("reject",  "submitted", "rejected"),
+                ("revise",  "rejected",  "draft"),
+                ("cancel",  "*",         "rejected"),
+                ("log",     "*",         None),
+            ],
+            initial="draft",
+        )
+        assert m.lint(include_info=True) == []
+
+    def test_include_info_default_false_hides_info_keeps_warnings(self):
+        m = Machine(states=["a", "b", "c"], transitions=[("go", "a", "b")], initial="a")
+        default = m.lint()
+        assert len(default) == 1
+        assert all(f.severity == "warning" for f in default)
+
+        with_info = m.lint(include_info=True)
+        assert len(with_info) == 2
+        assert any(f.severity == "info" for f in with_info)
+
+
+# ─── 1.6.0: audit 2026-10 (forja lot) — re-entrancy and to_dict snapshots ──
+
+class TestReentrancy:
+    """Re-entrant trigger()/reset() from inside a callback is unsupported
+    (DeprecationWarning since 1.6.0, raises in 2.0), but history/undo must
+    stay consistent in the common auto-transition-on-enter case."""
+
+    @staticmethod
+    def _auto(fail=False, **kw):
+        h = {}
+        def enter_b(ctx):
+            h["m"].trigger("go2")
+            if fail:
+                raise RuntimeError("boom")
+        m = Machine(states=["a", "b", "c"], transitions=[("go1", "a", "b"), ("go2", "b", "c")],
+                    initial="a", on_enter={"b": enter_b}, **kw)
+        h["m"] = m
+        return m
+
+    def test_nested_trigger_warns_and_history_stays_chronological(self):
+        m = self._auto()
+        with pytest.warns(DeprecationWarning, match="re-entrant"):
+            m.trigger("go1")
+        assert m.state == "c"
+        assert m.history == ["a", "b"]          # was ['b', 'a']: undo() moved forward
+        assert m.undo() == "b"
+        assert m.undo() == "a"
+
+    def test_nested_commit_then_outer_failure_leaves_no_phantom_history(self):
+        m = self._auto(fail=True)
+        with pytest.warns(DeprecationWarning), pytest.raises(RuntimeError):
+            m.trigger("go1")
+        assert m.state == "a"
+        assert m.history == []                  # was ['b']: undo() landed on a never-observed state
+        with pytest.raises(MachineError):
+            m.undo()
+
+    def test_nested_commit_then_failure_at_maxlen_leaves_no_phantom(self):
+        h = {}
+        def enter_b(ctx):
+            h["m"].trigger("go2")
+            raise RuntimeError("boom")
+        m = Machine(["z", "a", "b", "c"], [("z2a", "z", "a"), ("go1", "a", "b"), ("go2", "b", "c")],
+                    "z", history_size=1, on_enter={"b": enter_b})
+        h["m"] = m
+        m.trigger("z2a")
+        with pytest.warns(DeprecationWarning), pytest.raises(RuntimeError):
+            m.trigger("go1")
+        assert m.state == "a"
+        # The nested commit evicted the real 'z' entry at maxlen (deque semantics,
+        # unrecoverable); what must never survive is the phantom 'b'.
+        assert "b" not in m.history
+        assert len(m.history) <= 1
+
+    def test_reentrant_from_action_warns(self):
+        h = {}
+        m = Machine(["A", "B", "X"],
+                    [("go", "A", "B", None, lambda c: h["m"].trigger("side")), ("side", "A", "X")], "A")
+        h["m"] = m
+        with pytest.warns(DeprecationWarning, match="re-entrant"):
+            m.trigger("go")
+
+    def test_reset_inside_callback_warns(self):
+        h = {}
+        m = Machine(["A", "B"], [("go", "A", "B")], "A", on_enter={"B": lambda c: h["m"].reset()})
+        h["m"] = m
+        with pytest.warns(DeprecationWarning, match="re-entrant"):
+            m.trigger("go")
+
+    def test_observer_chaining_is_not_reentrant(self):
+        # Observers run after commit: chaining from an observer is sequential.
+        m = Machine(["a", "b", "c"], [("go1", "a", "b"), ("go2", "b", "c")], "a")
+        m.subscribe(lambda t, s, d, c: m.trigger("go2") if t == "go1" else None)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            m.trigger("go1")
+        assert m.state == "c"
+        assert m.history == ["a", "b"]
+
+    def test_non_reentrant_code_emits_no_warning(self):
+        m = make_order()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            m.trigger("submit")
+            m.trigger("approve", score=80)
+            m.undo()
+            m.transition_to("approved", score=80)
+            m.reset()
+
+
+class TestToDictSnapshots:
+    """to_dict() returns a real snapshot: deep copies (shallow with
+    shallow_ctx=True), never live references to ctx or the undo history."""
+
+    def test_snapshot_does_not_change_when_action_mutates_nested_value(self):
+        m = Machine(["a", "b"], [("go", "a", "b", None, lambda c: c["items"].append(1))],
+                    "a", ctx={"items": []})
+        snap = m.to_dict()
+        m.trigger("go")
+        assert snap["ctx"]["items"] == []
+        m2 = Machine(["a", "b"], [], "a")
+        m2.load_dict(snap)
+        assert m2.ctx["items"] == []
+
+    def test_mutating_to_dict_output_does_not_corrupt_live_ctx_or_undo(self):
+        m = Machine(["a", "b"], [("go", "a", "b")], "a", ctx={"items": []})
+        m.trigger("go")
+        d = m.to_dict()
+        d["ctx"]["items"].append(8)
+        d["history"][0]["ctx"]["items"].append(9)
+        assert m.ctx == {"items": []}
+        m.undo()
+        assert m.ctx == {"items": []}
+
+    def test_shallow_ctx_opt_out_keeps_to_dict_shallow(self):
+        shared = []
+        m = Machine(["a"], [], "a", ctx={"items": shared}, shallow_ctx=True)
+        assert m.to_dict()["ctx"]["items"] is shared
+
+    def test_submachine_restore_restores_exactly_what_exit_saved(self):
+        inner = Machine(["a", "b"], [("go", "a", "b", None, lambda c: c["items"].append(1))],
+                        "a", ctx={"items": []})
+        sub = SubMachine("p", inner)
+        sub.exit({})
+        inner.trigger("go")
+        sub.restore()
+        assert inner.state == "a"
+        assert inner.ctx["items"] == []
+
+
+# ─── Audit 2026-10: motor y API ──────────────────────────────────────────────
+
+class TestAudit2026_10_Motor:
+    """Regression anchors for the 2026-10 adversarial audit (engine/API batch)."""
+
+    # PER-MOT-005: explicit-vs-wildcard classification in transition_to()
+    def test_transition_to_trigger_with_explicit_edge_is_explicit_even_if_wildcard_first(self):
+        log = []
+        m = Machine(
+            ["a", "d"],
+            [
+                ("t1", "*", "d", None, lambda c: log.append("t1-wild")),
+                ("t1", "a", "d", None, lambda c: log.append("t1-explicit")),
+                ("t2", "a", "d", None, lambda c: log.append("t2")),
+            ],
+            "a",
+        )
+        m.transition_to("d")
+        assert log == ["t1-explicit"]
+
+    def test_transition_to_explicit_registered_before_wildcard_control(self):
+        log = []
+        m = Machine(
+            ["a", "d"],
+            [
+                ("t1", "a", "d", None, lambda c: log.append("t1-explicit")),
+                ("t1", "*", "d", None, lambda c: log.append("t1-wild")),
+                ("t2", "a", "d", None, lambda c: log.append("t2")),
+            ],
+            "a",
+        )
+        m.transition_to("d")
+        assert log == ["t1-explicit"]
+
+    # PER-MOT-004: no_deterministic_edge only if the winner PRECEDES an edge to dest
+    def test_transition_to_guard_blocked_and_later_edge_elsewhere_is_guard_rejected(self):
+        m = Machine(
+            ["a", "b", "c"],
+            [("go", "a", "b", lambda c: c.get("ok", False)), ("go", "a", "c")],
+            "a",
+        )
+        with pytest.raises(GuardRejected) as ei:
+            m.transition_to("b")
+        assert ei.value.reason == "guard_rejected"
+        assert m.state == "a"
+
+    def test_transition_to_higher_priority_edge_elsewhere_is_no_deterministic_edge(self):
+        m = Machine(
+            ["a", "b", "c"],
+            [("go", "a", "c"), ("go", "a", "b", lambda c: c.get("ok", False))],
+            "a",
+        )
+        with pytest.raises(GuardRejected) as ei:
+            m.transition_to("b")
+        assert ei.value.reason == "no_deterministic_edge"
+
+    def test_transition_to_guard_passing_still_commits(self):
+        m = Machine(
+            ["a", "b", "c"],
+            [("go", "a", "b", lambda c: c.get("ok", False)), ("go", "a", "c")],
+            "a",
+        )
+        assert m.transition_to("b", ok=True) == "b"
+
+    # PER-SER-001: from_dict/from_json structural validation
+    @pytest.mark.parametrize("js", [
+        '{}', '[]', 'null', '"a"', '{"state":"a","initial":[1]}', '{"state":[]}',
+    ])
+    def test_from_json_wrong_structure_raises_machine_error(self, js):
+        with pytest.raises(MachineError):
+            Machine.from_json(["a", "b"], [("t", "a", "b")], js)
+
+    def test_from_dict_non_dict_raises_machine_error(self):
+        with pytest.raises(MachineError, match="expects a dict"):
+            Machine.from_dict(["a", "b"], [("t", "a", "b")], ["state", "a"])  # deliberately wrong type
+
+    def test_from_json_minimal_document_still_builds(self):
+        m = Machine.from_json(["a", "b"], [("t", "a", "b")], '{"state":"a"}')
+        assert m.state == "a"
+
+    def test_from_json_malformed_json_still_raises_json_error(self):
+        with pytest.raises(json.JSONDecodeError):
+            Machine.from_json(["a", "b"], [("t", "a", "b")], "{not json")
+
+    # PER-MOT-006: exceptions survive pickle / copy / deepcopy
+    def test_invalid_transition_pickle_roundtrip(self):
+        e = InvalidTransition("go", "a", reason="unknown_state")
+        e2 = pickle.loads(pickle.dumps(e))
+        assert type(e2) is InvalidTransition
+        assert (e2.trigger, e2.state, e2.reason) == ("go", "a", "unknown_state")
+        assert str(e2) == str(e)
+
+    def test_guard_rejected_pickle_roundtrip(self):
+        e = GuardRejected("go", "a", reason="no_deterministic_edge")
+        e2 = pickle.loads(pickle.dumps(e))
+        assert type(e2) is GuardRejected
+        assert (e2.trigger, e2.state, e2.reason) == ("go", "a", "no_deterministic_edge")
+        assert str(e2) == str(e)
+
+    @pytest.mark.parametrize("clone", [copy.copy, copy.deepcopy])
+    def test_exceptions_copy_and_deepcopy(self, clone):
+        for e in (InvalidTransition("go", "a"), GuardRejected("go", "a")):
+            e2 = clone(e)
+            assert type(e2) is type(e)
+            assert (e2.trigger, e2.state, e2.reason) == (e.trigger, e.state, e.reason)
+            assert str(e2) == str(e)
+
+    def test_exception_stored_in_ctx_does_not_break_next_trigger(self):
+        m = Machine(["a", "b"], [("go", "a", "b")], "a")
+        try:
+            m.trigger("nope")
+        except InvalidTransition as e:
+            m.ctx["last_error"] = e
+        assert m.trigger("go") == "b"
+        assert isinstance(m.ctx["last_error"], InvalidTransition)
+
+    # PER-LOG-001: registering the same _Transition instance twice
+    def test_same_transition_instance_twice_is_one_dead_edge(self):
+        from tramoya import _Transition
+        tr = _Transition("t", "a", "b")
+        m = Machine(["a", "b"], [tr, tr], "a")
+        assert [f.kind for f in m.lint()].count("dead_edge") == 1
+        assert m.trigger("t") == "b"
+
+    def test_equal_but_distinct_instances_between_are_two_dead_edges(self):
+        from tramoya import _Transition
+        t = _Transition("t", "a", "b")
+        u = _Transition("t", "a", "b")
+        m = Machine(["a", "b"], [t, u, t], "a")
+        assert [f.kind for f in m.lint()].count("dead_edge") == 2
+
+    def test_same_wildcard_instance_twice_is_one_dead_edge(self):
+        from tramoya import _Transition
+        w = _Transition("t", "*", "a")
+        m = Machine(["a", "b"], [w, w], "a")
+        assert [f.kind for f in m.lint()].count("dead_edge") == 1
+
+    # PER-MOT-012: "*" as a state name is reserved
+    def test_wildcard_state_name_deprecated(self):
+        with pytest.warns(DeprecationWarning, match="reserved"):
+            Machine(["*", "b"], [], "b")
+
+    def test_no_wildcard_state_no_warning(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            Machine(["a", "b"], [("go", "*", "b")], "a")
+
+    # PER-CTX-001: an empty caller-supplied ctx dict is bound by reference
+    def test_empty_ctx_dict_is_bound_by_reference(self):
+        shared = {}
+        m = Machine(["a", "b"], [("go", "a", "b")], "a", ctx=shared)
+        m.trigger("go", x=1)
+        assert shared is m.ctx
+        assert shared == {"x": 1}
+
+    # PER-MOT-011: early validation of callables and tuple length
+    def test_non_callable_guard_rejected_at_construction(self):
+        with pytest.raises(MachineError, match="guard"):
+            Machine(["a", "b"], [("go", "a", "b", "yes")], "a")
+
+    def test_non_callable_action_rejected_at_construction(self):
+        with pytest.raises(MachineError, match="action"):
+            Machine(["a", "b"], [("go", "a", "b", None, "yes")], "a")
+
+    def test_non_callable_on_enter_on_exit_on_transition_rejected(self):
+        with pytest.raises(MachineError, match=r"on_enter\['b'\] must be callable"):
+            Machine(["a", "b"], [], "a", on_enter={"b": None})  # deliberately wrong type
+        with pytest.raises(MachineError, match=r"on_exit\['a'\] must be callable"):
+            Machine(["a", "b"], [], "a", on_exit={"a": 3})  # deliberately wrong type
+        with pytest.raises(MachineError, match="on_transition"):
+            Machine(["a", "b"], [], "a", on_transition="nope")  # deliberately wrong type
+
+    def test_subscribe_non_callable_rejected_and_state_untouched(self):
+        m = Machine(["a", "b"], [("go", "a", "b")], "a")
+        with pytest.raises(MachineError, match="observer"):
+            m.subscribe(None)  # deliberately wrong type
+        assert m.trigger("go") == "b"
+
+    def test_long_transition_tuple_warns_and_still_works(self):
+        with pytest.warns(DeprecationWarning, match="extra elements"):
+            m = Machine(["a", "b"], [("go", "a", "b", None, None, "extra", 7)], "a")
+        assert m.trigger("go") == "b"
+
+    def test_five_element_tuple_does_not_warn(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            Machine(["a", "b"], [("go", "a", "b", None, lambda c: None)], "a")
+
+
+class TestAudit2026_10_Compuestos:
+    """Regression anchors for the 2026-10 adversarial audit (composites,
+    serialization, builder, export and docs batch)."""
+
+    # PER-CMP-006: a failed ParallelMachine.load_dict puts the SAME objects back
+    def test_parallel_failed_load_keeps_lock_ctx_and_original_error(self):
+        r1 = Machine(["a", "b"], [("t", "a", "b")], "a", shallow_ctx=True)
+        lock = threading.Lock()
+        r1.ctx["lock"] = lock
+        r2 = Machine(["x", "y"], [("t", "x", "y")], "x")
+        pm = ParallelMachine(r1=r1, r2=r2)
+        with pytest.raises(MachineError, match="NOPE"):
+            pm.load_dict({"r1": {"state": "b"}, "r2": {"state": "NOPE"}})
+        assert r1.state == "a"
+        assert r1.ctx["lock"] is lock
+
+    def test_parallel_failed_load_restores_loaded_region_despite_untouched_uncopyable_one(self):
+        b = Machine(["p", "q"], [], "p", shallow_ctx=True)
+        b.ctx["lock"] = threading.Lock()  # never part of the load: must not matter
+        a = Machine(["x", "y"], [("t", "x", "y")], "x")
+        c = Machine(["m", "n"], [], "m")
+        pm = ParallelMachine(b=b, a=a, c=c)
+        with pytest.raises(MachineError, match="NOPE"):
+            pm.load_dict({"a": {"state": "y"}, "c": {"state": "NOPE"}})
+        assert a.state == "x"
+        assert pm.state == {"b": "p", "a": "x", "c": "m"}
+
+    def test_parallel_failed_load_preserves_ctx_object_identity(self):
+        ref = [1, 2, 3]
+        r1 = Machine(["a", "b"], [], "a", ctx={"k": ref})
+        r2 = Machine(["x", "y"], [], "x")
+        pm = ParallelMachine(r1=r1, r2=r2)
+        with pytest.raises(MachineError):
+            pm.load_dict({"r1": {"state": "b", "ctx": {}}, "r2": {"state": "NOPE"}})
+        assert r1.state == "a"
+        assert r1.ctx["k"] is ref
+
+    def test_parallel_successful_load_still_applies_everything(self):
+        r1 = Machine(["a", "b"], [], "a")
+        r2 = Machine(["x", "y"], [], "x")
+        pm = ParallelMachine(r1=r1, r2=r2)
+        pm.load_dict({"r1": {"state": "b", "ctx": {"n": 1}}, "r2": {"state": "y"}})
+        assert pm.state == {"r1": "b", "r2": "y"}
+        assert r1.ctx == {"n": 1}
+
+    # PER-SUB-001: load_dict / SubMachine honor shallow_ctx
+    def test_load_dict_shallow_ctx_copies_shallowly_ctx_and_history(self):
+        m = Machine(["a", "b"], [], "a", shallow_ctx=True)
+        lock = threading.Lock()
+        data = {"state": "b", "ctx": {"lock": lock},
+                "history": [{"state": "a", "ctx": {"lock": lock}}]}
+        m.load_dict(data)
+        assert m.state == "b"
+        assert m.ctx["lock"] is lock
+        assert m.ctx is not data["ctx"]  # still a copy of the dict itself
+        m.undo()
+        assert m.state == "a"
+        assert m.ctx["lock"] is lock
+
+    def test_load_dict_default_mode_still_rejects_uncopyable_ctx(self):
+        m = Machine(["a", "b"], [], "a")
+        with pytest.raises(MachineError, match="not deep-copyable"):
+            m.load_dict({"state": "b", "ctx": {"lock": threading.Lock()}})
+        assert m.state == "a"
+
+    def test_submachine_restore_with_shallow_inner_keeps_state_and_lock(self):
+        inner = Machine(["s1", "s2"], [("n", "s1", "s2")], "s1", shallow_ctx=True)
+        sub = SubMachine("p", inner)
+        lock = threading.Lock()
+        inner.ctx["lock"] = lock
+        inner.trigger("n")
+        sub.exit({})
+        sub.restore()
+        assert inner.state == "s2"
+        assert inner.ctx["lock"] is lock
+
+    def test_submachine_enter_shared_key_by_reference_when_inner_shallow(self):
+        inner = Machine(["s1", "s2"], [], "s1", shallow_ctx=True)
+        sub = SubMachine("p", inner, shared_keys=["lock"])
+        lock = threading.Lock()
+        sub.enter({"lock": lock})
+        assert inner.ctx["lock"] is lock
+
+    def test_submachine_enter_uncopyable_shared_key_with_default_inner_is_machine_error(self):
+        inner = Machine(["s1", "s2"], [], "s1")
+        sub = SubMachine("p", inner, shared_keys=["lock"])
+        with pytest.raises(MachineError, match="shared key 'lock' is not deep-copyable"):
+            sub.enter({"lock": threading.Lock()})
+
+    def test_submachine_enter_default_inner_still_deep_copies_shared_keys(self):
+        inner = Machine(["s1", "s2"], [], "s1")
+        sub = SubMachine("p", inner, shared_keys=["cfg", "missing"])
+        cfg = {"depth": [1, 2]}
+        sub.enter({"cfg": cfg, "other": 1})
+        assert inner.ctx == {"cfg": {"depth": [1, 2]}}
+        assert inner.ctx["cfg"] is not cfg
+        assert inner.ctx["cfg"]["depth"] is not cfg["depth"]
+
+    # PER-CMP-004: ParallelMachine.trigger is not atomic across regions (documented)
+    def test_parallel_trigger_keeps_earlier_regions_committed_when_a_later_one_raises(self):
+        def boom(ctx):
+            raise RuntimeError("boom")
+
+        a = Machine(["x", "y"], [("go", "x", "y")], "x")
+        b = Machine(["p", "q"], [("go", "p", "q")], "p", on_enter={"q": boom})
+        pm = ParallelMachine(a=a, b=b)
+        with pytest.raises(RuntimeError, match="boom"):
+            pm.trigger("go")
+        assert pm.state == {"a": "y", "b": "p"}
+
+    # PER-CMP-005: guard-blocked vs. unknown trigger; undo(region="")
+    def test_parallel_trigger_guard_blocked_in_every_region_is_guard_rejected(self):
+        a = Machine(["a", "b"], [("go", "a", "b", lambda c: False)], "a")
+        pm = ParallelMachine(r=a)
+        with pytest.raises(GuardRejected) as exc:
+            pm.trigger("go")
+        assert exc.value.reason == "guard_rejected"
+        assert exc.value.trigger == "go"
+        assert pm.state == {"r": "a"}
+
+    def test_parallel_trigger_guard_blocked_with_other_region_lacking_trigger_is_guard_rejected(self):
+        blocked = Machine(["a", "b"], [("go", "a", "b", lambda c: False)], "a")
+        other = Machine(["x", "y"], [("stop", "x", "y")], "x")
+        pm = ParallelMachine(blocked=blocked, other=other)
+        with pytest.raises(GuardRejected):
+            pm.trigger("go")
+
+    def test_parallel_trigger_unknown_everywhere_is_still_invalid_transition(self):
+        a = Machine(["a", "b"], [("go", "a", "b", lambda c: False)], "a")
+        pm = ParallelMachine(r=a)
+        with pytest.raises(InvalidTransition) as exc:
+            pm.trigger("nope")
+        assert exc.value.reason == "no_edge"
+
+    def test_parallel_undo_empty_region_name_is_unknown_region(self):
+        a = Machine(["a", "b"], [("go", "a", "b")], "a")
+        pm = ParallelMachine(r=a)
+        pm.trigger("go")
+        with pytest.raises(MachineError, match="Unknown region ''"):
+            pm.undo(region="")
+        assert pm.state == {"r": "b"}
+
+    def test_parallel_undo_region_none_still_undoes_all_regions(self):
+        a = Machine(["a", "b"], [("go", "a", "b")], "a")
+        c = Machine(["x", "y"], [("go", "x", "y")], "x")
+        pm = ParallelMachine(a=a, c=c)
+        pm.trigger("go")
+        assert pm.undo(region=None) == {"a": "a", "c": "x"}
+
+    # PER-BLD-001: build() hands the machine its own copy of the hook dicts
+    def test_builder_hooks_registered_after_build_do_not_leak_into_built_machine(self):
+        log = []
+        b = MachineBuilder("a")
+        b.add_states("a", "b")
+        b.transition("go", "a", "b")
+
+        @b.enter("b")
+        def first(ctx):
+            log.append("first")
+
+        @b.exit("a")
+        def leaving_a(ctx):
+            log.append("exit-a")
+
+        m = b.build()
+
+        @b.enter("b")
+        def second(ctx):
+            log.append("second")
+
+        @b.exit("a")
+        def leaving_a_again(ctx):
+            log.append("exit-a-2")
+
+        m.trigger("go")
+        assert log == ["exit-a", "first"]
+
+    # PER-BLD-002: re-registering a guard/action for the same edge is deprecated
+    def test_builder_duplicate_guard_warns(self):
+        b = MachineBuilder("a")
+        b.add_states("a", "b")
+        b.transition("go", "a", "b")
+
+        @b.guard("go", "a", "b")
+        def g1(ctx):
+            return True
+
+        with pytest.warns(DeprecationWarning, match="already registered") as rec:
+            @b.guard("go", "a", "b")
+            def g2(ctx):
+                return False
+        assert "2.0" in str(rec[0].message)
+        assert rec[0].filename == __file__
+        assert b.build().can("go") is False  # the last one wins (today)
+
+    def test_builder_duplicate_action_warns(self):
+        b = MachineBuilder("a")
+        b.add_states("a", "b")
+        b.transition("go", "a", "b")
+
+        @b.on("go", "a", "b")
+        def act1(ctx):
+            pass
+
+        with pytest.warns(DeprecationWarning, match="action for .* already registered"):
+            @b.on("go", "a", "b")
+            def act2(ctx):
+                pass
+
+    def test_builder_distinct_edges_do_not_warn(self):
+        b = MachineBuilder("a")
+        b.add_states("a", "b", "c")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+
+            @b.guard("go", "a", "b")
+            def g1(ctx):
+                return True
+
+            @b.guard("go", "a", "c")
+            def g2(ctx):
+                return True
+
+            @b.on("go", "a", "b")
+            def act(ctx):
+                pass
+
+    # PER-EQU-001: initial takes part in equality
+    def test_machines_differing_only_in_initial_are_not_equal(self):
+        a = Machine(["x", "y"], [], "x")
+        b = Machine(["x", "y"], [], "y")
+        b.reset("x")
+        assert a.state == b.state
+        assert a != b
+
+    def test_machines_with_same_initial_are_equal(self):
+        a = Machine(["x", "y"], [], "x")
+        b = Machine(["x", "y"], [], "x")
+        assert a == b
+
+    # PER-SER-003: load_dict validates every history entry but copies only the kept ones
+    def test_load_dict_history_size_zero_never_copies_dropped_history(self):
+        m = Machine(["a", "b"], [], "a", history_size=0)
+        hist = [{"state": "a", "ctx": {"lock": threading.Lock()}} for _ in range(3)]
+        m.load_dict({"state": "b", "history": hist})
+        assert m.state == "b"
+        assert m.history == []
+
+    def test_load_dict_truncated_history_never_copies_dropped_entries(self):
+        m = Machine(["a", "b", "c"], [], "a", history_size=2)
+        hist = [{"state": "a", "ctx": {"lock": threading.Lock()}} for _ in range(3)]
+        hist += [{"state": "b", "ctx": {"n": 1}}, {"state": "c", "ctx": {"n": 2}}]
+        with pytest.warns(DeprecationWarning, match="history truncated from 5 to 2"):
+            m.load_dict({"state": "a", "history": hist})
+        assert m.history == ["b", "c"]
+        m.undo()
+        assert m.ctx == {"n": 2}
+
+    def test_load_dict_kept_history_is_still_deep_copied(self):
+        m = Machine(["a", "b"], [], "a")
+        entry_ctx = {"items": [1]}
+        m.load_dict({"state": "b", "history": [{"state": "a", "ctx": entry_ctx}]})
+        entry_ctx["items"].append(2)
+        m.undo()
+        assert m.ctx == {"items": [1]}
+
+    def test_load_dict_still_validates_history_entries_that_will_be_dropped(self):
+        m0 = Machine(["a", "b"], [], "a", history_size=0)
+        with pytest.raises(MachineError, match="Unknown state 'zzz' in history"):
+            m0.load_dict({"state": "b", "history": [{"state": "zzz"}]})
+        assert m0.state == "a"
+        m2 = Machine(["a", "b"], [], "a", history_size=2)
+        hist = [{"state": "zzz"}, {"state": "a"}, {"state": "b"}]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with pytest.raises(MachineError, match="Unknown state 'zzz' in history"):
+                m2.load_dict({"state": "b", "history": hist})
+        assert m2.state == "a"
+        with pytest.raises(MachineError, match="'ctx' must be a dict"):
+            m0.load_dict({"state": "b", "history": [{"state": "a", "ctx": 3}]})
+
+    # PER-CMP-003: SubMachine state is not part of the parent snapshot (documented, pinned)
+    def test_submachine_state_is_not_in_parent_snapshot(self):
+        def build():
+            inner = Machine(["a", "b"], [("go", "a", "b")], "a")
+            sub = SubMachine("p", inner)
+            parent = Machine(
+                ["idle", "p", "done"],
+                [("start", "idle", "p"), ("finish", "p", "done")],
+                "idle",
+                on_enter={"p": sub.enter},
+                on_exit={"p": sub.exit},
+            )
+            return parent, sub
+
+        parent, sub = build()
+        parent.trigger("start")
+        sub.trigger("go")
+        parent.trigger("finish")
+        snap = parent.to_json()
+        assert set(json.loads(snap)) == {"state", "initial", "ctx", "history"}
+
+        parent2, sub2 = build()
+        parent2.load_dict(json.loads(snap))
+        assert parent2.state == "done"
+        sub2.restore()
+        assert sub2.machine.state == "a"  # inner back at its own initial state
+
+    # PER-CMP-002: shared_keys flow parent -> child on enter() only
+    def test_submachine_shared_keys_are_enter_only_and_restore_reloads_saved_inner_ctx(self):
+        inner = Machine(["a", "b"], [("go", "a", "b")], "a")
+        sub = SubMachine("p", inner, shared_keys=["user"])
+        parent_ctx = {"user": "ana"}
+        sub.enter(parent_ctx)
+        assert inner.ctx == {"user": "ana"}
+        inner.ctx["user"] = "inner-edit"
+        inner.trigger("go")
+        sub.exit(parent_ctx)
+        assert parent_ctx == {"user": "ana"}  # nothing copied back on exit()
+        parent_ctx["user"] = "changed-meanwhile"
+        sub.restore()
+        assert inner.state == "b"
+        assert inner.ctx == {"user": "inner-edit"}  # exactly as saved at exit()
+
+    # PER-EXP-001: every line separator is normalized before it can break a Mermaid edge
+    @pytest.mark.parametrize("sep", ["\r", "\r\n", "\n", "\x0b", "\x0c", "\x85", "\u2028", "\u2029"])
+    def test_mermaid_label_normalizes_line_separators(self, sep):
+        m = Machine(["a", "b"], [(f"x{sep}b --> a : evil", "a", "b")], "a")
+        out = m.to_mermaid()
+        assert "\r" not in out
+        assert "<br/>" in out
+        assert len([ln for ln in out.splitlines() if "-->" in ln]) == 1
+        assert len(out.splitlines()) == 2  # header + the single edge: no separator splits a line
+
+    def test_mermaid_label_plain_trigger_unchanged(self):
+        m = Machine(["a", "b"], [("go", "a", "b")], "a")
+        assert m.to_mermaid() == "stateDiagram-v2\n    a --> b : go"
+
+
+# ─── 1.6.0: audit 2026-10 — G4 follow-up (reviewer findings) ────────────────
+
+class TestAudit2026_10_G4:
+    """Gaps the blind G4 review found: the full-deque branch of
+    _record_undo_point, warning attribution for undo()/transition_to(),
+    to_dict() error type, tolerant validation, __reduce__ extras."""
+
+    @staticmethod
+    def _chain(prior, maxlen, nested=True):
+        h = {}
+        on_enter = {}
+        if nested:
+            on_enter = {"a": lambda c: h["m"].trigger("go1"), "b": lambda c: h["m"].trigger("go2")}
+        m = Machine(["p", "a", "b", "c"],
+                    [("warm", "p", "p"), ("start", "p", "a"), ("go1", "a", "b"), ("go2", "b", "c")],
+                    "p", history_size=maxlen, on_enter=on_enter)
+        h["m"] = m
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            for _ in range(prior):
+                m.trigger("warm")
+            m.trigger("start")
+            if not nested:
+                m.trigger("go1")
+                m.trigger("go2")
+        return m
+
+    @pytest.mark.parametrize("maxlen", [1, 2, 3, 4, 6])
+    @pytest.mark.parametrize("prior", [0, 1, 2, 3, 5])
+    def test_nested_chain_matches_sequential_even_with_full_history(self, maxlen, prior):
+        # Fills the deque to maxlen BEFORE the nested chain, so the popleft +
+        # insert branch of _record_undo_point is exercised, then compares with
+        # the plain sequential run: same state, same history, same undo walk.
+        nested, flat = self._chain(prior, maxlen), self._chain(prior, maxlen, nested=False)
+        assert nested.state == flat.state == "c"
+        assert nested.history == flat.history
+        assert len(nested.history) <= maxlen
+        walk_n, walk_f = [], []
+        for m, walk in ((nested, walk_n), (flat, walk_f)):
+            while m.history:
+                walk.append(m.undo())
+        assert walk_n == walk_f
+
+    def test_undo_inside_callback_warns_and_points_at_caller(self):
+        h = {}
+        m = Machine(["p", "a", "b"], [("start", "p", "a"), ("go", "a", "b")], "p",
+                    on_enter={"b": lambda c: h["m"].undo()})
+        h["m"] = m
+        m.trigger("start")
+        with pytest.warns(DeprecationWarning, match="re-entrant undo") as rec:
+            m.trigger("go")
+        assert rec[0].filename == __file__
+
+    def test_transition_to_inside_callback_warns_and_points_at_caller(self):
+        h = {}
+        m = Machine(["a", "b", "c"], [("go1", "a", "b"), ("go2", "b", "c")], "a",
+                    on_enter={"b": lambda c: h["m"].transition_to("c")})
+        h["m"] = m
+        with pytest.warns(DeprecationWarning, match="re-entrant trigger") as rec:
+            m.trigger("go1")
+        assert rec[0].filename == __file__
+        assert m.state == "c"
+        assert m.history == ["a", "b"]
+
+    def test_reset_inside_callback_warning_points_at_caller(self):
+        h = {}
+        m = Machine(["A", "B"], [("go", "A", "B")], "A", on_enter={"B": lambda c: h["m"].reset()})
+        h["m"] = m
+        with pytest.warns(DeprecationWarning, match="re-entrant reset") as rec:
+            m.trigger("go")
+        assert rec[0].filename == __file__
+
+    def test_to_dict_uncopyable_ctx_raises_machine_error_in_default_mode(self):
+        m = Machine(["a"], [], "a", ctx={"lock": threading.Lock()})
+        with pytest.raises(MachineError, match="deep-copyable"):
+            m.to_dict()
+        d = {}
+        for _ in range(5000):
+            d = {"k": d}
+        m2 = Machine(["a"], [], "a", ctx={"deep": d})
+        with pytest.raises(MachineError):
+            m2.to_dict()
+
+    def test_to_json_matches_to_dict_and_tolerates_what_to_dict_copies(self):
+        m = Machine(["a", "b"], [("go", "a", "b")], "a", ctx={"items": [1, {"x": (1, 2)}]})
+        m.trigger("go", n=2)
+        assert json.loads(m.to_json()) == json.loads(json.dumps(m.to_dict()))
+
+    def test_falsy_action_and_on_transition_placeholders_still_accepted(self):
+        m = Machine(["a", "b"], [("go", "a", "b", None, False)], "a", on_transition=False)
+        assert m.trigger("go") == "b"
+
+    def test_non_callable_guard_in_transition_instance_rejected(self):
+        with pytest.raises(MachineError, match="guard"):
+            Machine(["a", "b"], [_Transition("go", "a", "b", guard=5)], "a")  # type: ignore[arg-type]
+        with pytest.raises(MachineError, match="action"):
+            Machine(["a", "b"], [_Transition("go", "a", "b", action="yes")], "a")  # type: ignore[arg-type]
+
+    def test_reduce_keeps_extra_attributes(self):
+        import pickle
+        e = GuardRejected("go", "a")
+        e.request_id = 7  # type: ignore[attr-defined]
+        e2 = pickle.loads(pickle.dumps(e))
+        assert (e2.trigger, e2.state, e2.reason, str(e2)) == ("go", "a", "guard_rejected", str(e))
+        assert e2.request_id == 7  # type: ignore[attr-defined]
